@@ -2,7 +2,7 @@
 
 **snypshot** (with a **y**) is a Lightshot-style screenshot tool for Linux. Press Print Screen, drag a box, scribble on it, then copy or save. That's it.
 
-<!-- Add a GIF here: docs/demo.gif -->
+<img width="800" height="450" alt="demo" src="https://github.com/user-attachments/assets/f543a1a5-ba26-4743-b4de-e79e7bb62a4c" />
 
 ## Install
 
