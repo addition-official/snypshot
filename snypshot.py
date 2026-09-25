@@ -1,6 +1,7 @@
 #!/usr/bin/python3 -I
 """
 snypshot - a tiny Lightshot-style screenshot tool for Linux.
+https://github.com/addition-official/snypshot
 
   snypshot              take a screenshot (Print Screen runs this; `shot` works too)
   snypshot --setup      install everything in one go (run as yourself; asks for sudo)
@@ -12,8 +13,8 @@ snypshot - a tiny Lightshot-style screenshot tool for Linux.
   snypshot --once       one screenshot without the background copy
   snypshot --allow-portal / --disallow-portal   GNOME fallback without the helper (opt-in)
 
-Install (GNOME on Wayland, tested on Ubuntu 24.04):
-  python3 snypshot.py --setup        then log out and back in once
+Install (GNOME or KDE Plasma on Wayland, tested on Ubuntu 24.04 and 26.04):
+  python3 snypshot.py --setup        on GNOME, then log out and back in once
 
   Drag                  select an area
   Drag inside / edges   move / resize the selection (like Lightshot)
@@ -22,6 +23,7 @@ Install (GNOME on Wayland, tested on Ubuntu 24.04):
   Shift while drawing   straight 45-degree lines, square boxes
   Enter / Ctrl+C        copy to clipboard and close
   Ctrl+S                save to a file
+  Ctrl+P                print (or print to PDF)
   Ctrl+Z / Ctrl+Y       undo / redo
   Esc / right-click     cancel
 
@@ -34,18 +36,45 @@ private pipe. The overlay is a native Wayland window other apps can't read. See 
 import os
 import sys
 
-RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/snypshot-{os.getuid()}"
+def xdg(var, default):
+    """An XDG folder from the environment, if it's set to an absolute path (the spec says
+    to ignore anything else), else the default."""
+    v = os.environ.get(var) or ""
+    return v if os.path.isabs(v) else os.path.expanduser(default)
+
+
+RUNTIME_DIR = xdg("XDG_RUNTIME_DIR", f"/tmp/snypshot-{os.getuid()}")
 SOCK = os.path.join(RUNTIME_DIR, "snypshot", "snypshot.sock")
-VERSION = "1.0"   # bump on every release: a newer `snypshot` replaces an older running copy
+VERSION = "1.1"   # bump on every release
+
+
+def build_id():
+    """Version plus a fingerprint of this exact file, so the background copy gets
+    replaced after ANY update, even one that forgot to bump VERSION."""
+    import hashlib
+    try:
+        with open(os.path.realpath(__file__), "rb") as f:
+            return f"{VERSION} {hashlib.sha256(f.read()).hexdigest()[:12]}"
+    except OSError:
+        return VERSION
+
+
+BUILD = build_id()                # what this running copy is
 
 
 def send(cmd, timeout=1.0):  # noqa: E302
     """Talk to the background copy. Returns its reply, or None if it isn't running."""
     import socket
+    import struct
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(timeout)
         s.connect(SOCK)
+        _pid, uid, _gid = struct.unpack("3i", s.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+        if uid != os.getuid():                    # only ever talk to our own snypshot
+            s.close()
+            return None
         s.sendall(cmd.encode() + b"\n")
         reply = s.recv(256).decode().strip()
         s.close()
@@ -77,9 +106,16 @@ if __name__ == "__main__" and (not sys.flags.isolated
     # Isolated mode (-I) with the root-owned system Python: ignores PYTHON* variables,
     # your user site-packages and the current folder. Re-run ourselves that way before
     # importing anything else.
+    if os.environ.get("SNYPSHOT_REEXEC"):         # (already did: the system Python itself
+        sys.exit("snypshot: /usr/bin/python3 isn't root-owned; refusing to run")  # is odd)
+    env = {k: v for k, v in os.environ.items() if not k.startswith((
+        "LD_", "PYTHON", "GI_TYPELIB", "GIO_EXTRA", "GIO_MODULE", "GTK_PATH", "GTK_MODULES",
+        "GTK_EXE_PREFIX", "GDK_PIXBUF_MODULE", "GSETTINGS_SCHEMA_DIR", "VK_", "__EGL",
+        "LIBGL_DRIVERS", "GST_PLUGIN"))}          # (ways to load outside code into us)
+    env["SNYPSHOT_REEXEC"] = "1"
     os.execve("/usr/bin/python3", ["/usr/bin/python3", "-I", os.path.abspath(sys.argv[0])]
-              + sys.argv[1:],
-              {k: v for k, v in os.environ.items() if not k.startswith(("LD_", "PYTHON"))})
+              + sys.argv[1:], env)
+os.environ.pop("SNYPSHOT_REEXEC", None)
 
 # Only import from folders nobody but root can change.
 sys.path[:] = [p for p in sys.path if _root_only(p)]
@@ -87,11 +123,46 @@ sys.path[:] = [p for p in sys.path if _root_only(p)]
 OLD_NAME = "shot"                 # what snypshot was called before; `shot` stays as an alias
 BIN = "/usr/local/bin/snypshot"
 ALIAS = "/usr/local/bin/shot"
+# KDE Plasma: KWin only hands screenshots to programs listed as trusted in a desktop
+# file, matched by the program's executable. snypshot runs on its own copy of Python
+# for that, so /usr/bin/python3 itself stays untrusted. Note that ANY script started
+# with that copy is trusted too, so programs you run can take silent screenshots
+# through it - the same thing KDE already allows through Spectacle (spectacle -b).
+# (Under /usr, not /usr/local: Python finds its standard library by looking upwards from
+# where it lives, and must never pick up a Python someone built into /usr/local.)
+KDE_PY = "/usr/libexec/snypshot/python3"
+OLD_KDE_PY = "/usr/local/lib/snypshot/python3"    # where 1.1 test builds put it
+# In /usr/share (not /usr/local/share): that folder is always in KDE's search path.
+KWIN_DESKTOP = "/usr/share/applications/io.github.snypshot.kwin.desktop"
+OLD_KWIN_DESKTOP = "/usr/local/share/applications/io.github.snypshot.kwin.desktop"
+KWIN_DESKTOP_CODE = f"""[Desktop Entry]
+Type=Application
+Name=snypshot (screen capture)
+Comment=Lightshot-style screenshots: lets snypshot ask KWin for screenshots
+Exec={KDE_PY} -I {BIN} --daemon
+NoDisplay=true
+X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
+"""
+
+
+def is_kde():
+    return "kde" in os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
 ALIAS_CODE = f"""#!/usr/bin/python3 -I
 # `shot` is a short alias for snypshot (a Lightshot-style screenshot tool).
 import os, sys
 os.execv({BIN!r}, [{BIN!r}] + sys.argv[1:])
 """
+
+
+def _ours_py(path):
+    """True if path is missing or is our Python copy (a Python interpreter)."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == b"\x7fELF"
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
 
 
 def _ours(path):
@@ -106,25 +177,95 @@ def _ours(path):
     return b"Lightshot-style" in head
 
 
+# Runs as root (through sudo) in setup: copy one file into place, but only if it's
+# exactly the one we meant (checksum given up front).
+ROOT_INSTALLER = r"""
+import hashlib, os, stat, sys
+want, src, dest, mode = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4], 8)
+try:
+    fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+except OSError:
+    sys.exit("  refused: the file was replaced while sudo was waiting; nothing was installed")
+st = os.fstat(fd)
+if not stat.S_ISREG(st.st_mode) or st.st_size > 256 << 20:
+    sys.exit("  refused: not a normal file")
+data = bytearray()
+while len(data) <= 256 << 20:
+    chunk = os.read(fd, 1 << 20)
+    if not chunk:
+        break
+    data += chunk
+os.close(fd)
+if hashlib.sha256(data).hexdigest() != want:
+    sys.exit("  refused: the file changed while sudo was waiting; nothing was installed")
+os.makedirs(os.path.dirname(dest), mode=0o755, exist_ok=True)
+tmp = dest + ".snypshot-new"
+try:
+    os.unlink(tmp)
+except FileNotFoundError:
+    pass
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+try:
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+    os.fsync(fd)
+    os.fchmod(fd, mode)
+finally:
+    os.close(fd)
+os.rename(tmp, dest)
+"""
+
+
 def setup():
     """One command for everything: dependencies, the program itself, the `shot` alias,
     then the per-user part (--install). Uses only the standard library, so it works
     before the dependencies are there."""
-    import subprocess, tempfile
+    import hashlib, subprocess
     sys.stdout.reconfigure(line_buffering=True)  # keep our lines in order with sudo's
     me = os.path.realpath(__file__)
     if os.geteuid() == 0:
         sys.exit("Run this as yourself, without sudo. It asks for your password when needed.")
+    with open(me, "rb") as f:                  # read it once, first: this exact copy is
+        code = f.read()                        # what gets installed, whatever happens later
     desk = os.environ.get("XDG_CURRENT_DESKTOP", "")
     wayland = bool(os.environ.get("WAYLAND_DISPLAY")) or os.environ.get("XDG_SESSION_TYPE") == "wayland"
     print("Setting up snypshot.")
-    if "gnome" not in desk.lower() or not wayland:
-        print(f"  Heads up: snypshot is made for GNOME on Wayland (you're on "
+    if not ("gnome" in desk.lower() or "kde" in desk.lower()) or not wayland:
+        print(f"  Heads up: snypshot is made for GNOME or KDE Plasma on Wayland (you're on "
               f"{desk or 'an unknown desktop'}, {'Wayland' if wayland else 'X11'}). Carrying on anyway.")
 
     def run(cmd):
         print("  $ " + " ".join(cmd))
         return subprocess.run(cmd).returncode == 0
+
+    def sudo_install(data, dest, mode="755"):
+        """Root copy of data at dest. Root reads it from a private temp copy, but only
+        installs it if it matches (sha256) exactly what we read at the start - that
+        checksum is fixed on root's command line before sudo even asks for your
+        password, so a file swapped or symlinked meanwhile is refused, never installed.
+        It's written next to dest and renamed into place, so it's never half there."""
+        import shutil, tempfile
+        tmpdir = tempfile.mkdtemp(prefix="snypshot-setup-")      # 0700, ours
+        src = os.path.join(tmpdir, os.path.basename(dest))
+        try:
+            with open(src, "wb") as f:
+                f.write(data)
+            print(f"  Installing {dest}")
+            if subprocess.run(["/usr/bin/sudo", "/usr/bin/python3", "-I", "-c", ROOT_INSTALLER,
+                               hashlib.sha256(data).hexdigest(), src, dest, mode]).returncode:
+                return False
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        try:
+            with open(dest, "rb") as f:
+                same = hashlib.sha256(f.read()).digest() == hashlib.sha256(data).digest()
+        except OSError:
+            same = False
+        if not same:
+            print(f"  {dest} doesn't match what was downloaded; removing it to be safe.")
+            subprocess.run(["/usr/bin/sudo", "/usr/bin/rm", "-f", dest])
+        return same
 
     probe = ("import gi; gi.require_version('Gtk', '4.0'); gi.require_version('PangoCairo', '1.0');"
              "from gi.repository import Gtk, PangoCairo; import PIL, cairo")
@@ -159,18 +300,37 @@ def setup():
         print("1/3 Dependencies: already there.")
 
     print("2/3 Installing snypshot to /usr/local/bin:")
-    if not (_ours(BIN) and run(["/usr/bin/sudo", "install", "-m", "755", me, BIN] if me != BIN
-                                else ["true"])):
+    if not _ours(BIN):
+        sys.exit(f"  {BIN} belongs to another program; not touching it.")
+    if me != BIN and not sudo_install(code, BIN):
         sys.exit(f"  Couldn't install {BIN}.")
     if _ours(ALIAS):
-        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
-            f.write(ALIAS_CODE)
-        ok = run(["/usr/bin/sudo", "install", "-m", "755", f.name, ALIAS])
-        os.unlink(f.name)
-        if not ok:
+        if not sudo_install(ALIAS_CODE.encode(), ALIAS):
             print(f"  (Couldn't add the `shot` alias; `snypshot` works.)")
     else:
         print(f"  {ALIAS} belongs to another program, so no `shot` alias; use `snypshot`.")
+
+    if is_kde():                               # KDE: snypshot's own Python for KWin
+        import shutil
+        if not shutil.which("spectacle"):
+            print("  Note: like Spectacle, this lets programs you run take screenshots "
+                  "without asking.")
+        real_py = os.path.realpath("/usr/bin/python3")
+        with open(real_py, "rb") as f:
+            py = f.read()
+        if not (_ours_py(KDE_PY) and _ours(KWIN_DESKTOP) and sudo_install(py, KDE_PY)
+                and sudo_install(KWIN_DESKTOP_CODE.encode(), KWIN_DESKTOP, "644")):
+            print("  (Couldn't set up fast KWin screenshots; snypshot will use Spectacle.)")
+        elif subprocess.run([KDE_PY, "-I", "-c", "import gi, PIL, cairo"],
+                            capture_output=True).returncode != 0:
+            print("  (snypshot's Python copy doesn't work here; snypshot will use Spectacle.)")
+            subprocess.run(["/usr/bin/sudo", "/usr/bin/rm", "-f", KDE_PY, KWIN_DESKTOP])
+        for old in (OLD_KWIN_DESKTOP, OLD_KDE_PY):     # test builds put them here
+            if os.path.exists(old) and (_ours(old) if old.endswith(".desktop") else _ours_py(old)):
+                subprocess.run(["/usr/bin/sudo", "/usr/bin/rm", "-f", old])
+        if os.path.isdir(os.path.dirname(OLD_KDE_PY)):                   # (only if empty)
+            subprocess.run(["/usr/bin/sudo", "/usr/bin/rmdir", os.path.dirname(OLD_KDE_PY)],
+                           capture_output=True)
 
     print("3/3 Setting it up for you:")
     os.execv(BIN, [BIN, "--install", "--from-setup"])
@@ -182,7 +342,7 @@ if __name__ == "__main__" and sys.argv[1:2] == ["--setup"]:
 # Fast path for the Print Screen key: if snypshot is already running, just poke it
 # and exit before loading anything heavy.
 if __name__ == "__main__" and sys.argv[1:] in ([], ["--capture"]):
-    if send("version") == VERSION and send("capture") == "ok":
+    if send("version") == BUILD and send("capture") == "ok":
         sys.exit(0)                               # (an older running copy: see main)
 
 
@@ -203,7 +363,7 @@ from PIL import Image, ImageColor, ImageDraw, ImageFont
 
 WAYLAND = (bool(os.environ.get("WAYLAND_DISPLAY"))
            or os.environ.get("XDG_SESSION_TYPE") == "wayland")
-CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+CONFIG = os.path.join(xdg("XDG_CONFIG_HOME", "~/.config"),
                       "snypshot", "config.json")
 
 # Same order as Lightshot's vertical toolbar.
@@ -211,7 +371,8 @@ TOOLS = ["pen", "line", "arrow", "rect", "marker", "text"]
 DRAW_TOOLS = ("pen", "line", "arrow", "rect", "marker")
 TIPS = {"pen": "Pen", "line": "Line", "arrow": "Arrow", "rect": "Rectangle",
         "marker": "Marker", "text": "Text", "color": "Color", "undo": "Undo (Ctrl+Z)",
-        "copy": "Copy (Ctrl+C)", "save": "Save (Ctrl+S)", "close": "Close (Esc)"}
+        "copy": "Copy (Ctrl+C)", "save": "Save (Ctrl+S)", "close": "Close (Esc)",
+        "print": "Print (Ctrl+P)"}
 
 # The 48 "Basic colors" from the classic Windows color dialog Lightshot uses.
 BASIC_COLORS = [
@@ -260,10 +421,12 @@ SAFE_ENV = ("HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "DISPLAY", "WAYLAND_D
 SAFE_PATH = "/usr/local/bin:/usr/bin:/bin"
 
 
-def root_owned(path):
+def root_owned(path, _depth=0):
     """True if path and every folder above it belong to root and only root can change
     them - i.e. nothing running as you could have swapped it."""
     import stat
+    if _depth > 20:                               # a symlink loop
+        return False
     path = os.path.abspath(path)
     while True:
         try:
@@ -275,7 +438,7 @@ def root_owned(path):
                 target = os.path.join(os.path.dirname(path), os.readlink(path))
             except OSError:
                 return False
-            if not root_owned(target) or st.st_uid != 0:
+            if not root_owned(target, _depth + 1) or st.st_uid != 0:
                 return False
         elif st.st_uid != 0 or st.st_mode & 0o022:
             return False
@@ -318,14 +481,26 @@ def clean_env():
     return env
 
 
-def no_dumps():
+def no_dumps(on=True):
     """Mark this process non-dumpable: no core dump or crash report can contain a
-    screenshot, and no other program running as you can attach a debugger to it."""
+    screenshot, and no other program running as you can attach a debugger to it.
+    no_dumps(False) undoes it for a moment (see grab_kwin). The core size limit is set
+    to 0 as well, so even then no core dump gets written."""
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except Exception as e:
+        log(f"couldn't limit core dumps: {e}")
     try:
         import ctypes
-        ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0)   # PR_SET_DUMPABLE = 4
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(4, 0 if on else 1, 0, 0, 0)                    # PR_SET_DUMPABLE
+        if libc.prctl(3, 0, 0, 0, 0) != (0 if on else 1):        # PR_GET_DUMPABLE: check it
+            raise OSError("the setting didn't stick")
+        return True
     except Exception as e:
-        log(f"couldn't disable core dumps: {e}")
+        log(f"couldn't {'protect snypshot' if on else 'let KWin identify snypshot'}: {e}")
+        return False
 
 
 def private_dir():
@@ -373,6 +548,12 @@ EXT_METADATA = """{
 # The only D-Bus methods are Start() (make sure snypshot is running) and Check() (status
 # text); neither takes or shows a screenshot. Captures are requested by snypshot itself,
 # which only takes orders from you over its private per-user socket.
+#
+# On KDE Plasma there is no helper. KWin gives screenshots to programs whose desktop
+# file lists them as trusted; setup installs such a file for snypshot's own root-owned
+# copy of Python (see KDE_PY). That is the same kind of permission KDE gives Spectacle,
+# so it doesn't open anything new on a normal Plasma install: any program you run could
+# already take a silent screenshot with `spectacle -b`.
 EXT_JS_TEMPLATE = r"""// snypshot helper - see the security notes in the snypshot script itself.
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
@@ -705,7 +886,7 @@ export default class ShotHelper extends Extension {
 
 
 def ext_dir():
-    data = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
+    data = xdg("XDG_DATA_HOME", "~/.local/share")
     return os.path.join(data, "gnome-shell", "extensions", EXT_UUID)
 
 
@@ -758,6 +939,7 @@ class HelperChannel:
                 if parts[1].decode() == self.want:      # anything unrequested is dropped
                     self.data = data if parts[0] == b"IMG" else None
                     self.event.set()
+            del data                                     # (don't keep the last screenshot)
 
     def say(self, line):
         self.out.write(line.encode() + b"\n")
@@ -775,7 +957,7 @@ class HelperChannel:
             return None
         self.event.wait(timeout)
         with self.lock:
-            data, self.want = self.data, None
+            data, self.want, self.data = self.data, None, None
         return data
 
 
@@ -1011,9 +1193,7 @@ def grab_with(cmd_for, timeout=4):
         log(f"{cmd[0]} made no image (exit {r.returncode}): {r.stderr.strip()[:300]}")
     except subprocess.TimeoutExpired:
         name = os.path.basename(cmd[0])
-        log(f"{name} hung for {timeout}s, giving up on it")
-        subprocess.run([T("pkill"), "-f", f"^(/usr/bin/)?{name}( |$)"],   # don't leave it stuck
-                       capture_output=True, env=clean_env())
+        log(f"{name} hung for {timeout}s, giving up on it")   # (run() already stopped it)
     except Exception as e:
         log(f"{cmd[0]} failed: {e}")
     finally:
@@ -1025,6 +1205,7 @@ def grab_with(cmd_for, timeout=4):
 
 
 _working_method = None      # remembered while running in the background
+_kwin_error = None          # why KWin last said no (for --doctor)
 _old_helper = False         # the GNOME part still loaded is an old one (log out to update)
 
 
@@ -1060,15 +1241,16 @@ def grab_screen():
         methods = ["gnome"]           # (spectacle may go through the portal: opt-in only)
         if load_config().get("allow_portal"):
             methods.append("spectacle")
-    elif "kde" in desktop:
-        methods = ["spectacle", "gnome", "grim"]
+    elif "kde" in desktop:                    # KWin only answers snypshot's own Python
+        methods = (["kwin"] if os.path.realpath(sys.executable) == KDE_PY else []) + ["spectacle"]
     else:
         methods = ["grim", "gnome", "spectacle"]
     # GNOME's screenshot portal is only used if you opted in (snypshot --allow-portal).
     if load_config().get("allow_portal"):
         methods.insert(1, "portal")
 
-    if _working_method in methods:          # try whatever worked last time first
+    if _working_method in methods and methods[0] != "kwin":  # try what worked last time
+        # first (but always KWin first on KDE: it's the fast one, and says no instantly)
         methods.remove(_working_method)
         methods.insert(0, _working_method)
 
@@ -1087,6 +1269,8 @@ def grab_screen():
             img = grab_with(lambda t: [T("spectacle"), "-b", "-n", "-f", "-o", t])
         elif m == "portal":
             img = grab_portal()
+        elif m == "kwin":
+            img = grab_kwin()
         else:
             continue
         if img:
@@ -1107,6 +1291,67 @@ def grab_screen():
             else "install grim (sway/Hyprland), gnome-screenshot (GNOME) or spectacle (KDE)")
     sys.exit(f"snypshot: couldn't capture the screen on this Wayland desktop "
              f"({desktop or 'unknown'}).\nFix: {hint}")
+
+
+def grab_kwin():
+    """KDE Plasma: ask KWin for each screen at its own resolution (pixel-perfect on
+    mixed scaling, and fast). KWin only answers programs it trusts, which is what
+    snypshot's own Python (set up by --setup) is for; otherwise this returns None and
+    Spectacle is used instead."""
+    import select
+    from gi.repository import Gio, GLib as G
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        mons = Gdk.Display.get_default().get_monitors()
+        parts = []
+        for i in range(mons.get_n_items()):
+            mon = mons.get_item(i)
+            name = mon.get_connector()
+            g = mon.get_geometry()
+            r, w = os.pipe()
+            try:
+                fds = Gio.UnixFDList.new()
+                idx = fds.append(w)
+                os.close(w)
+                # KWin checks who's asking by reading /proc/<our pid>/exe, which it can't
+                # while we're non-dumpable. So allow that just for the moment of the call
+                # (core dumps stay off through the size limit).
+                no_dumps(False)
+                try:
+                    res, _ = bus.call_with_unix_fd_list_sync(
+                        "org.kde.KWin", "/org/kde/KWin/ScreenShot2", "org.kde.KWin.ScreenShot2",
+                        "CaptureScreen", G.Variant("(sa{sv}h)", (
+                            name, {"native-resolution": G.Variant("b", True)}, idx)),
+                        G.VariantType("(a{sv})"), Gio.DBusCallFlags.NONE, 5000, fds, None)
+                finally:
+                    for fd in fds.steal_fds():
+                        os.close(fd)
+                    if not no_dumps(True):             # never keep running unprotected
+                        log("couldn't make snypshot private again; stopping")
+                        os._exit(1)
+                meta = res.unpack()[0]
+                data = bytearray()
+                while True:                            # KWin writes it, then closes
+                    ready, _, _ = select.select([r], [], [], 5)
+                    if not ready:
+                        raise TimeoutError("KWin didn't send the screenshot")
+                    chunk = os.read(r, 1 << 20)
+                    if not chunk:
+                        break
+                    data += chunk
+            finally:
+                os.close(r)
+            W, H, stride = int(meta["width"]), int(meta["height"]), int(meta["stride"])
+            if not (0 < W <= 16384 and 0 < H <= 16384 and len(data) >= stride * H):
+                raise ValueError("odd screenshot from KWin")
+            img = Image.frombuffer("RGBA", (W, H), bytes(data), "raw", "BGRA", stride, 1)
+            parts.append(((g.x, g.y, g.width, g.height), img.convert("RGB")))
+        return parts or None
+    except Exception as e:
+        global _kwin_error
+        _kwin_error = str(e).split(": ")[-1][:200]
+        log(f"KWin screenshot not available ({str(e)[:200]})")
+        return None
 
 
 def copy_png(img):
@@ -1133,7 +1378,7 @@ def notify(msg):
 
 
 DEFAULT_KEYS = {"copy": "<Control>c", "save": "<Control>s", "save_as": "<Control><Shift>s",
-                "undo": "<Control>z", "redo": "<Control>y"}
+                "print": "<Control>p", "undo": "<Control>z", "redo": "<Control>y"}
 DEFAULTS = {
     "color": "#ff0000", "width": 3, "custom": [None] * 16, "slot": 0, "ui_scale": None,
     "allow_portal": False, "last_dir": None,
@@ -1147,7 +1392,10 @@ DEFAULTS = {
     "notify": True,                 # a notification after saving / copying
     "dim": 0.45,                    # how dark the area outside the selection is
     "show_size": True,              # the 800x600 label above the selection
+    "watermark": True,              # a small "Screenshot taken with snypshot" in the bottom-right corner
     "tray": True,                   # tray icon
+    "classic_picker": False,        # the Windows/Lightshot color dialog instead of ours
+    "picker_editor": False,         # our picker opens with the fine-tune editor showing
     "keys": dict(DEFAULT_KEYS),     # shortcuts inside the screenshot
 }
 ACCEL_RE = re.compile(r"(<(Control|Primary|Shift|Alt|Super|Meta|Hyper)>){0,4}[A-Za-z0-9_]{1,32}")
@@ -1157,7 +1405,7 @@ def load_config():
     cfg = json.loads(json.dumps(DEFAULTS))
     try:
         with open(CONFIG) as f:
-            data = json.load(f)
+            data = json.load(f, parse_constant=lambda c: None)   # no NaN / Infinity
         if isinstance(data, dict):
             cfg.update(data)
     except Exception:
@@ -1171,7 +1419,7 @@ def load_config():
         cfg["color"] = "#ff0000"
     try:
         cfg["width"] = max(1, min(20, int(cfg.get("width", 3))))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         cfg["width"] = 3
     custom = cfg.get("custom") if isinstance(cfg.get("custom"), list) else []
     cfg["custom"] = [c if hex_ok(c) else None for c in (custom + [None] * 16)[:16]]
@@ -1182,7 +1430,7 @@ def load_config():
     for k in ("last_dir", "save_dir"):
         if not (isinstance(cfg.get(k), str) and os.path.isabs(cfg[k]) and os.path.isdir(cfg[k])):
             cfg[k] = None
-    pick("hotkey", accel_ok)
+    pick("hotkey", lambda v: v == "" or accel_ok(v))      # "" = shortcut switched off
     pick("save_mode", lambda v: v in ("last", "fixed"))
     pick("name_style", lambda v: v in ("number", "date"))
     pick("name_prefix", lambda v: isinstance(v, str) and len(v) <= 64 and not v.startswith(".")
@@ -1190,7 +1438,7 @@ def load_config():
     pick("format", lambda v: v in ("png", "jpg"))
     pick("jpg_quality", lambda v: isinstance(v, int) and not isinstance(v, bool) and 50 <= v <= 100)
     pick("dim", lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= 0.9)
-    for k in ("notify", "show_size", "tray"):
+    for k in ("notify", "show_size", "watermark", "tray", "classic_picker", "picker_editor"):
         pick(k, lambda v: isinstance(v, bool))
     keys = cfg.get("keys") if isinstance(cfg.get("keys"), dict) else {}
     cfg["keys"] = {a: keys[a] if accel_ok(keys.get(a)) or keys.get(a) == "" else d
@@ -1202,13 +1450,36 @@ def save_config(cfg):
     """Write the whole config atomically (a crash can't leave half a file), private."""
     try:
         os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
-        tmp = CONFIG + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump(cfg, f, indent=1)
-        os.replace(tmp, CONFIG)
+        import tempfile
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CONFIG), prefix=".config-")  # 0600
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(cfg, f, indent=1)
+            os.replace(tmp, CONFIG)
+        except BaseException:
+            os.unlink(tmp)
+            raise
     except Exception:
         pass
+
+
+def current_umask():
+    mask = os.umask(0o022)
+    os.umask(mask)
+    return mask
+
+
+def release_memory():
+    """Hand freed screenshot memory back to the system (Python and glibc otherwise keep
+    it around for reuse, which shows up as a big number in System Monitor)."""
+    import gc
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+    return False
 
 
 def next_file_name(folder, cfg):
@@ -1259,6 +1530,33 @@ def load_font(px):
         return ImageFont.load_default(size=px)
     except TypeError:
         return ImageFont.load_default()
+
+
+WATERMARK = "Screenshot taken with snypshot"
+WATERMARK_PX = 11                  # text height, in desktop units (like on screen)
+WATERMARK_MARGIN = 6
+
+
+def watermark_fits(w, h, tw, th, m):
+    """Only on screenshots big enough that it doesn't cover the picture."""
+    return w >= tw + 2 * m + 40 and h >= 3 * (th + 2 * m)
+
+
+def add_watermark(img, s):
+    """"Screenshot taken with snypshot" in the bottom-right corner: small, white with a soft dark
+    edge so it reads on any background. Preferences > Saving turns it off."""
+    font = load_font(max(8, round(WATERMARK_PX * s)))
+    m = round(WATERMARK_MARGIN * s)
+    edge = max(1, round(s))
+    x0, y0, x1, y1 = font.getbbox(WATERMARK, stroke_width=edge)
+    tw, th = x1 - x0, y1 - y0
+    if not watermark_fits(img.width, img.height, tw, th, m):
+        return img
+    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    ImageDraw.Draw(layer).text((img.width - m - tw - x0, img.height - m - th - y0), WATERMARK,
+                               font=font, fill=(255, 255, 255, 128), stroke_width=edge,
+                               stroke_fill=(0, 0, 0, 50))   # see-through
+    return Image.alpha_composite(img.convert("RGBA"), layer)
 
 
 def stroke(draw, pts, col, w):
@@ -1321,6 +1619,12 @@ def make_icon(name, size, bg=BAR_BG):
         d.rounded_rectangle(p((2.5, 2.5), (15.5, 15.5)), radius=S, outline=c, width=w(1.4))
         d.rectangle(p((5.5, 2.5), (12, 6.8)), fill=c)
         d.rectangle(p((5, 10), (13, 15.5)), outline=c, width=w(1.3))
+    elif name == "print":
+        d.rectangle(p((5, 2.5), (13, 7)), outline=c, width=w(1.3))
+        d.rounded_rectangle(p((2, 6.5), (16, 13)), radius=S, fill=c)
+        d.rectangle(p((5, 10), (13, 15.8)), fill=back, outline=c, width=w(1.3))
+        d.line(p((7, 12.5), (11, 12.5)), fill=c, width=w(1))
+        d.rectangle(p((13.2, 8.2), (14.4, 9.2)), fill=back)
     elif name == "close":
         d.line(p((4, 4), (14, 14)), fill=c, width=w(1.9))
         d.line(p((14, 4), (4, 14)), fill=c, width=w(1.9))
@@ -1391,7 +1695,8 @@ def init_gtk():
             self.set_vexpand(True)
 
         def do_snapshot(self, snap):
-            self.overlay.snapshot(self, snap)
+            if self.overlay is not None:
+                self.overlay.snapshot(self, snap)
 
     Canvas = _Canvas
     if not Gtk.init_check():
@@ -1458,6 +1763,20 @@ class Overlay:
     """One screenshot session: fullscreen window(s) on every monitor, sharing one scene."""
 
     def __init__(self, capture, on_close=None, persistent=True):
+        self.wins = []
+        try:
+            self._setup(capture, on_close, persistent)
+        except BaseException:                     # never leave half-made windows behind
+            self.closed = True
+            for win in self.wins:
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+            self.wins = []
+            raise
+
+    def _setup(self, capture, on_close, persistent):
         self.on_close = on_close
         self.persistent = persistent          # daemon: keep clipboard alive after close
         self.cfg = load_config()
@@ -1497,7 +1816,7 @@ class Overlay:
                                              GLib.Bytes.new(im.tobytes()), im.width * 3)
         isz = self.S(ICON)
         self.icons = {k: pil_surface(make_icon(k, isz * self.dev))
-                      for k in TOOLS + ["undo", "copy", "save", "close"]}
+                      for k in TOOLS + ["undo", "print", "copy", "save", "close"]}
         self.sv_size = self.S(150)
         self.hue_w = self.S(16)
         self.hue_surf = pil_surface(hue_strip(self.hue_w * self.dev, self.sv_size * self.dev))
@@ -1526,14 +1845,24 @@ class Overlay:
         self.flash = None                       # "Aa" preview for the text tool
         self.flash_job = None
         self.mouse = (0, 0)
+        self.pointer_in = False                   # (no position until the mouse moves)
         self.shift = False
         self.dialog_open = False
         self.dialog_win = None
-        self.want_save = False
         self.hidden = False
 
         # One fullscreen window per monitor, fully drawn before it appears.
         self.wins, self.areas = [], []
+        self.ctls = []                          # (controller, widget, [handler ids])
+        # Typing goes through an input method (one per window), so dead keys (é, ñ),
+        # Compose and IBus (Chinese, Japanese...) work. Only attached while typing.
+        self.key_ctls = []                      # (key controller, window, im, handler)
+
+        def hook(widget, ctl, *signals):
+            ids = [ctl.connect(sig, fn, *args) for sig, fn, *args in signals]
+            widget.add_controller(ctl)
+            self.ctls.append((ctl, widget, ids))
+
         for gm, (mx, my, mw, mh) in zip(self.gmons, self.monitors):
             win = Gtk.Window()
             win.set_title("snypshot")
@@ -1543,25 +1872,23 @@ class Overlay:
 
             drag = Gtk.GestureDrag()
             drag.set_button(1)
-            drag.connect("drag-begin", self._drag_begin, area)
-            drag.connect("drag-update", self._drag_update, area)
-            drag.connect("drag-end", self._drag_end, area)
-            area.add_controller(drag)
+            hook(area, drag, ("drag-begin", self._drag_begin, area),
+                 ("drag-update", self._drag_update, area), ("drag-end", self._drag_end, area))
             rclick = Gtk.GestureClick()
             rclick.set_button(3)
-            rclick.connect("pressed", lambda *a: self.close())
-            area.add_controller(rclick)
+            hook(area, rclick, ("pressed", self._right_click))
             motion = Gtk.EventControllerMotion()
-            motion.connect("motion", self._motion, area)
-            area.add_controller(motion)
+            hook(area, motion, ("motion", self._motion, area), ("enter", self._motion, area))
             scroll = Gtk.EventControllerScroll.new(
                 Gtk.EventControllerScrollFlags.VERTICAL | Gtk.EventControllerScrollFlags.DISCRETE)
-            scroll.connect("scroll", self._scroll)
-            area.add_controller(scroll)
+            hook(area, scroll, ("scroll", self._scroll))
             keys = Gtk.EventControllerKey()
-            keys.connect("key-pressed", self._key_pressed)
-            keys.connect("key-released", self._key_released)
-            win.add_controller(keys)
+            hook(win, keys, ("key-pressed", self._key_pressed),
+                 ("key-released", self._key_released))
+            im = Gtk.IMMulticontext()
+            im.set_client_widget(win)
+            im.set_use_preedit(False)             # input methods show their own popup
+            self.key_ctls.append((keys, win, im, im.connect("commit", self._im_commit)))
 
             win.fullscreen_on_monitor(gm)
             self.wins.append(win)
@@ -1598,7 +1925,7 @@ class Overlay:
             self.drag_origin = None               # if you can click it anyway, the dialog
             self.cancel_dialog()                  # gives way (never a dead screen)
             return
-        self.drag_origin = (area.region[0] + x, area.region[1] + y)
+        self.drag_origin = (round(area.region[0] + x), round(area.region[1] + y))
         self.shift = bool(g.get_current_event_state() & Gdk.ModifierType.SHIFT_MASK)
         self.press(*self.drag_origin)
 
@@ -1610,9 +1937,6 @@ class Overlay:
         self.motion(round(x0 + dx), round(y0 + dy))
 
     def _drag_end(self, g, dx, dy, area):
-        if self.want_save:                        # Save button: open the dialog only
-            self.want_save = False                # once the click is over
-            GLib.timeout_add(60, lambda: self.save_dialog() or False)
         if not self.drag_origin:
             return
         x0, y0 = self.drag_origin
@@ -1621,8 +1945,14 @@ class Overlay:
     def _motion(self, ctl, x, y, area):
         gx, gy = round(area.region[0] + x), round(area.region[1] + y)
         self.mouse = (gx, gy)
+        self.pointer_in = True
         if not self.drag:
             self.hover_move(gx, gy)
+            if not self.sel and not self.closed:  # the "Select area" label follows you:
+                old = getattr(self, "label_rect", None)   # repaint only where it was/is
+                self.ui_ops, self.hot = [], []
+                self._build_ui()
+                self.redraw_rects([old, getattr(self, "label_rect", None)])
 
     def _scroll(self, ctl, dx, dy):
         if dy:
@@ -1636,17 +1966,22 @@ class Overlay:
             return True
         name = Gdk.keyval_name(keyval) or ""
         ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        if self.picker and self.picker.get("hex") is not None and not ctrl:
+            u = Gdk.keyval_to_unicode(keyval)
+            if self.hex_key(name, chr(u) if u else ""):
+                return True
         if name in ("Shift_L", "Shift_R"):
             self.shift_changed(True)
             return False
-        action = self.shortcut_for(keyval, state)
-        if name == "Escape":
+        if name == "Escape":                      # (Esc first, whatever else happens)
             self.escape()
-        elif name in ("Return", "KP_Enter"):
+            return True
+        action = self.shortcut_for(keyval, state, keycode)
+        if name in ("Return", "KP_Enter"):
             self.enter()
         elif action:
             {"copy": self.copy, "save": self.quick_save, "save_as": self.save_dialog,
-             "undo": self.undo, "redo": self.redo}[action]()
+             "print": self.print_dialog, "undo": self.undo, "redo": self.redo}[action]()
         elif self.entry and not ctrl:
             ch = chr(Gdk.keyval_to_unicode(keyval)) if Gdk.keyval_to_unicode(keyval) else ""
             return self.on_key(name, ch)
@@ -1656,7 +1991,7 @@ class Overlay:
 
     def tip_text(self, key):
         """Tooltip, with your current shortcut: "Save (Ctrl+S)"."""
-        action = {"copy": "copy", "save": "save", "undo": "undo"}.get(key)
+        action = {"copy": "copy", "save": "save", "undo": "undo", "print": "print"}.get(key)
         base = TIPS[key].split(" (")[0]
         accel = self.cfg.get("keys", DEFAULT_KEYS).get(action) if action else None
         if key == "close":
@@ -1667,7 +2002,7 @@ class Overlay:
                 return f"{base} ({Gtk.accelerator_get_label(k, m)})"
         return base
 
-    def shortcut_for(self, keyval, state):
+    def shortcut_for(self, keyval, state, keycode=None):
         """Which of your shortcuts (Preferences > Keyboard) this key press is, if any."""
         if not hasattr(self, "_accels"):
             self._accels = []
@@ -1684,9 +2019,17 @@ class Overlay:
         kv, mods = Gdk.keyval_to_lower(keyval), state & mods_mask()
         typing_safe = Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK | \
             Gdk.ModifierType.SUPER_MASK
-        for k, m, action in self._accels:
-            if k == kv and m == mods and (not self.entry or m & typing_safe):
+        usable = [(k, m, a) for k, m, a in self._accels
+                  if m == mods and (not self.entry or m & typing_safe)]
+        for k, m, action in usable:
+            if k == kv:
                 return action
+        if keycode is not None:              # other layouts (Russian...): Ctrl+C is still
+            disp = Gdk.Display.get_default()  # the key where C is on a Latin layout
+            for k, m, action in usable:
+                ok, keys = disp.map_keyval(k)
+                if ok and any(km.keycode == keycode for km in keys):
+                    return action
         return None
 
     def _key_released(self, ctl, keyval, keycode, state):
@@ -1698,6 +2041,14 @@ class Overlay:
     def redraw(self):
         for a in self.areas:
             a.queue_draw()
+
+    def redraw_rects(self, rects):
+        """Repaint only the monitors these (x, y, w, h) desktop rectangles touch."""
+        for a in self.areas:
+            ax0, ay0, ax1, ay1 = a.region
+            if any(r and r[0] < ax1 and r[0] + r[2] > ax0 and r[1] < ay1 and r[1] + r[3] > ay0
+                   for r in rects):
+                a.queue_draw()
 
     def set_cursor(self, name):
         if name != self.cursor:
@@ -1718,20 +2069,56 @@ class Overlay:
         for win in self.wins:
             win.set_visible(False)
 
+    def _right_click(self, *_):
+        self.close()
+
     def close(self):
         if self.closed:
             return
         self.closed = True
+        try:
+            self._teardown()
+        finally:                        # whatever happens above, the windows must go
+            for win in self.wins:
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+            self.wins, self.areas, self.gmons = [], [], []
+            self.parts = None
+            self.annots, self.undone, self.cur = [], [], None
+            on_close, self.on_close = self.on_close, None
+            GLib.timeout_add(300, release_memory)
+            if on_close:
+                on_close()
+
+    def _teardown(self):
         self.cancel_dialog()
+        if self.picker and self.picker.get("modern"):
+            self.save_mine()                      # keep edits to your colors
         for job in (self.tip_job, self.flash_job, self.entry and self.entry.get("blink")):
             if job:
                 self.after_cancel(job)
         self.cfg.update(color=self.color, width=self.width)
         update_config(color=self.color, width=self.width)
+        # Let go of everything: the windows and this object point at each other through
+        # GTK, which Python's garbage collector can't untangle by itself, so without
+        # this every screenshot ever taken would stay in memory.
+        for ctl, widget, ids in self.ctls:
+            for i in ids:
+                ctl.disconnect(i)
+            widget.remove_controller(ctl)
+        self.ctls = []
+        for ctl, win, im, hid in self.key_ctls:
+            ctl.set_im_context(None)
+            im.disconnect(hid)
+            im.focus_out()
+            im.set_client_widget(None)
+        self.key_ctls = []
+        for area in self.areas:
+            area.overlay = None
         for win in self.wins:
-            win.destroy()
-        if self.on_close:
-            self.on_close()
+            win.set_child(None)
 
     def escape(self):
         """Esc backs out one step at a time (like Lightshot): stop typing, close the color
@@ -1812,8 +2199,11 @@ class Overlay:
                 return
             self.commit_text()                    # clicked elsewhere: done typing
         key = self.hit(x, y)
-        if key is not None:
-            self.ui_press(key, x, y)
+        if key in ("sv", "hue", "panel"):         # dragging in the color square / hue bar
+            self.ui_press(key, x, y)              # starts right away
+            return
+        if key is not None:                       # buttons act when you let go, and only
+            self.drag = ("ui", key)               # if you let go on the same button
             return
         if self.picker:                           # click outside the color dialog closes it
             self.close_picker()
@@ -1848,6 +2238,8 @@ class Overlay:
                 return
             if self.annots:                       # don't let a stray click throw away drawings
                 return
+            self.drag = ("pending", (x, y), self.sel)   # a plain click outside does nothing;
+            return                                # only a real drag starts a new box
         self.drag = ("new", (x, y))
         self.set_sel(x, y, x, y)
         self.render_ui()
@@ -1857,6 +2249,13 @@ class Overlay:
         self.mouse = (x, y)
         if not d:
             return
+        if d[0] == "ui":                          # holding a button down
+            return
+        if d[0] == "pending":
+            sx, sy = d[1]
+            if abs(x - sx) <= 1 and abs(y - sy) <= 1:
+                return                            # still just a click
+            self.drag = d = ("new", (sx, sy), d[2])     # remember the old box
         if d[0] == "new":
             self.set_sel(*d[1], x, y)
         elif d[0] == "move":
@@ -1926,13 +2325,27 @@ class Overlay:
         d, self.drag = self.drag, None
         if not d:
             return
+        if d[0] == "pending":                     # clicked outside without dragging
+            return
+        if d[0] == "ui":
+            if self.hit(x, y) == d[1]:
+                self.ui_press(d[1], x, y)
+            else:
+                self.render_ui()                  # dragged off the button: nothing happens
+            return
+        if d[0] in ("sv", "hue") and self.picker and self.picker_editing() is not None:
+            self.save_mine()                      # finished tweaking one of your colors
         if d[0] == "tmove" and self.entry and not self.tmoved:
             self.place_caret(x)                   # a click in the text: move the cursor
             return
         if d[0] == "new":
             x0, y0, x1, y1 = self.sel
             if x1 - x0 < 4 or y1 - y0 < 4:
-                self.sel = None
+                self.sel = d[2] if len(d) > 2 else None   # too small: keep the old box
+        elif d[0] == "resize":
+            x0, y0, x1, y1 = self.sel
+            if x1 - x0 < 1 or y1 - y0 < 1:
+                self.sel = d[2]                   # squashed flat: put it back
         elif d[0] == "draw" and self.cur:
             a, self.cur = self.cur, None
             if not (a["type"] in ("line", "arrow", "rect") and len(a["pts"]) < 2):
@@ -2034,7 +2447,8 @@ class Overlay:
     def line_h(self, desc):
         return self.fonts.size("Ag", desc)[1]
 
-    def label_box(self, x, y, text, desc, fg="#ffffff", bg="#2b2b2b", anchor="nw", pad=None):
+    def label_box(self, x, y, text, desc, fg="#ffffff", bg="#2b2b2b", anchor="nw", pad=None,
+                  edge=None):
         """A text label whose box is sized to the text, kept on its monitor."""
         pad = self.S(7) if pad is None else pad
         tw, th = self.fonts.size(text, desc)
@@ -2044,8 +2458,9 @@ class Overlay:
         mx0, my0, mx1, my1 = self.mon_at(x + w / 2, y)
         x = max(mx0, min(x, mx1 - w))
         y = max(my0, min(y, my1 - h))
-        self.op("rect", x, y, x + w, y + h, bg, None, 1, None)
+        self.op("rect", x, y, x + w, y + h, bg, edge, 1, None)
         self.op("text", x + pad, y + h / 2, text, desc, fg, "w")
+        self.last_box = (x, y, w, h)
         return w, h
 
     def render_ui(self):
@@ -2058,10 +2473,19 @@ class Overlay:
 
     def _build_ui(self):
         if not self.sel:
-            for mx, my, mw, mh in self.monitors:
-                self.label_box(mx + mw / 2, my + self.S(24),
-                               "Drag to select an area   ·   Esc to cancel",
-                               self.f_head, anchor="n", pad=self.S(14))
+            if self.pointer_in:                   # a small label by the mouse, like Lightshot
+                k = self.S
+                px, py = self.mouse
+                text = "Select area"
+                w = self.fonts.size(text, self.f_ui)[0] + 2 * k(7)
+                h = self.line_h(self.f_ui) + k(6)
+                mx0, my0, mx1, my1 = self.mon_at(px, py)
+                x = px + k(12) if px + k(12) + w <= mx1 else px - k(6) - w   # right, or left
+                y = py + k(22) if py + k(22) + h <= my1 else py - k(8) - h   # below, or above
+                self.label_box(x, y, text, self.f_ui, fg="#222222", bg="#f5f5f5",
+                               edge="#767676")
+                bx, by, bw, bh = self.last_box
+                self.label_rect = (bx - 2, by - 2, bw + 4, bh + 4)
             return
         x0, y0, x1, y1 = self.sel
         k = self.S
@@ -2083,6 +2507,16 @@ class Overlay:
             self.label_box(x0, y0 - lh - k(2), label, self.f_bold)
         else:
             self.label_box(x0 + k(4), y0 + k(4), label, self.f_bold)
+
+        if self.cfg.get("watermark", True):       # what it'll look like (Preferences > Saving)
+            desc = self.fonts.desc(WATERMARK_PX, True)
+            tw, th = self.fonts.size(WATERMARK, desc)
+            m = WATERMARK_MARGIN
+            if watermark_fits(x1 - x0, y1 - y0, tw, th, m):
+                tx, ty = x1 - m - tw, y1 - m - th / 2
+                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    self.op("text", tx + dx, ty + dy, WATERMARK, desc, "#000000", "w", 0.12)
+                self.op("text", tx, ty, WATERMARK, desc, "#ffffff", "w", 0.5)
 
         if self.drag and self.drag[0] in ("new", "move", "resize"):
             return                                # Lightshot hides toolbars while dragging
@@ -2108,14 +2542,15 @@ class Overlay:
 
         # horizontal toolbar: under the selection, right-aligned
         sep = k(9)
-        hw, hh = b * 3 + sep + 2 * pad, b + 2 * pad
+        hkeys = ["print", "copy", "save", None, "close"]     # Lightshot's order
+        hw, hh = b * (len(hkeys) - 1) + sep + 2 * pad, b + 2 * pad
         hx = max(mx0, min(x1, mx1) - hw)
         hy = y1 + gap if y1 + gap + hh <= my1 else max(my0, min(y1, my1) - hh - gap)
         if hx < vx + vw and hx + hw > vx and hy < vy + vh and hy + hh > vy:
             hx = max(mx0, vx - hw - gap)
         self.bar(hx, hy, hw, hh)
         bx = hx + pad
-        for key in ["copy", "save", None, "close"]:
+        for key in hkeys:
             if key is None:
                 self.op("line", [(bx + sep / 2, hy + k(7)), (bx + sep / 2, hy + hh - k(7))],
                         "#c8c8c8", 1, "butt", 1.0)
@@ -2125,7 +2560,12 @@ class Overlay:
             bx += b
 
         if self.picker:
-            self.draw_picker()
+            first = len(self.ui_ops)
+            if self.picker.get("modern"):
+                self.draw_picker_modern()
+            else:
+                self.draw_picker()
+            self.picker_ops = (first, len(self.ui_ops))
 
         if self.tip and not self.picker:
             text, tx, ty = self.tip
@@ -2167,15 +2607,49 @@ class Overlay:
         elif key == "copy":
             self.copy()
             return
-        elif key == "save":
-            self.want_save = True                 # opens on release (see _drag_end)
+        elif key in ("save", "print"):
+            def open_dialog():                    # after the click; wait if the mouse
+                if self.closed:                   # is down again already
+                    return False
+                if self.drag:
+                    return True
+                (self.save_dialog if key == "save" else self.print_dialog)()
+                return False
+            GLib.timeout_add(60, open_dialog)
             return
         elif key == "close":
             self.close()
             return
+        elif self.picker and self.picker.get("modern") and key == "editor":
+            self.picker["editor"] = not self.picker.get("editor")
+            self.picker["hex"] = None
+            self.cfg["picker_editor"] = self.picker["editor"]
+            update_config(picker_editor=self.picker["editor"])
+        elif (self.picker and self.picker.get("modern") and not self.picker.get("editor")
+              and isinstance(key, tuple) and key[0] in ("basic", "mine")):
+            col = BASIC_COLORS[key[1]] if key[0] == "basic" else self.mine()[key[1]]
+            self.picker_set(col)                  # compact picker: a click uses the color
+            self.picker_ok()
+            return
+        elif self.picker and self.picker.get("modern") and (
+                key in ("add_mine", "remove_mine", "hex", "done")
+                or (isinstance(key, tuple) and key[0] == "mine")):
+            if self.mine_press(key, double):
+                return
         elif isinstance(key, tuple):                    # a color cell
             kind, i = key
+            if self.picker and self.picker.get("modern"):   # a basic color: just use it
+                self.picker["sel"], self.picker["hex"] = ("basic", i), None
+                self.picker_set(BASIC_COLORS[i])
+                if double:
+                    self.picker_ok()
+                    return
+                self.render_ui()
+                return
             col = BASIC_COLORS[i] if kind == "basic" else self.cfg["custom"][i]
+            if kind == "custom":                        # pick the box to fill / change
+                self.cfg["slot"] = i                    # (like Windows' color dialog)
+                update_config(slot=i)
             if col:
                 self.picker_set(col)
                 if double:
@@ -2195,6 +2669,7 @@ class Overlay:
             self.close_picker()
             return
         elif key in ("sv", "hue"):
+            self.picker["hex"] = None
             self.drag = (key,)
             self.picker_drag(key, x, y)
             return
@@ -2202,14 +2677,269 @@ class Overlay:
 
     # --- Windows-style color dialog
 
+    PICKER_ANIM = 0.14                            # seconds
+
+    def picker_grow(self):
+        """0..1 progress of the picker's open animation (eased)."""
+        t0 = getattr(self, "picker_t0", None)
+        if t0 is None:
+            return 1.0
+        t = min(1.0, (time.monotonic() - t0) / self.PICKER_ANIM)
+        return 1 - (1 - t) ** 3
+
+    def animate_picker(self):
+        t0 = self.picker_t0 = time.monotonic()
+
+        def frame():
+            if self.closed or not self.picker or self.picker_t0 is not t0:
+                return False                      # closed, or a newer animation took over
+            self.redraw()
+            if time.monotonic() - t0 >= self.PICKER_ANIM:
+                self.picker_t0 = None
+                self.redraw()
+                return False
+            return True
+        GLib.timeout_add(16, frame)
+
     def open_picker(self):
         h, s, v = colorsys.rgb_to_hsv(*[ch / 255 for ch in hex_rgb(self.color)])
-        self.picker = {"color": self.color, "expanded": False, "h": h, "s": s, "v": v}
+        self.picker = {"color": self.color, "expanded": False, "h": h, "s": s, "v": v,
+                       "modern": not self.cfg.get("classic_picker"), "sel": None,
+                       "hex": None, "editor": bool(self.cfg.get("picker_editor"))}
+        self.animate_picker()
+        if self.picker["modern"]:
+            mine = self.mine()
+            self.set_mine(mine)                   # no gaps: your colors in one row
+            # Show a basic color you're using as selected. One of YOUR colors only gets
+            # selected when you click it, since selecting it means editing it.
+            cur = self.color.lower()
+            if cur in [c.lower() for c in BASIC_COLORS]:
+                self.picker["sel"] = ("basic", [c.lower() for c in BASIC_COLORS].index(cur))
         self.render_ui()
 
     def close_picker(self):
+        if self.drag and self.drag[0] in ("ui", "sv", "hue"):
+            self.drag = None                      # a button held while it closed: forget it
+        if self.picker and self.picker.get("modern"):
+            self.save_mine()
         self.picker = None
         self.render_ui()
+
+    # --- the simpler color picker (default): pick, tweak, done. "My colors" are edited
+    # in place: select one and whatever you change on the right changes it.
+
+    # One thing is selected at a time (p["sel"]): a basic color ("basic", i) or one of
+    # yours ("mine", i). Changing the color on the right edits yours in place; a basic
+    # color can't be edited, so tweaking it just un-selects it.
+
+    def mine(self):
+        return [c for c in self.cfg["custom"] if c]
+
+    def set_mine(self, colors):
+        self.cfg["custom"] = (list(colors) + [None] * 16)[:16]
+
+    def save_mine(self):
+        update_config(custom=self.cfg["custom"])
+
+    def picker_editing(self):
+        """Index of your color being edited, or None."""
+        sel = self.picker.get("sel") if self.picker else None
+        return sel[1] if sel and sel[0] == "mine" else None
+
+    def picker_changed(self):
+        """The color changed on the right (square, hue bar or hex code)."""
+        p = self.picker
+        i = self.picker_editing()
+        if i is not None:
+            mine = self.mine()
+            if i < len(mine):
+                mine[i] = p["color"]
+                self.set_mine(mine)
+        elif p.get("sel"):                        # a tweaked basic color is a new color
+            p["sel"] = None
+
+    def picker_change(self, col):
+        self.picker_set(col)
+        self.picker_changed()
+
+    def mine_press(self, key, double):
+        p = self.picker
+        mine = self.mine()
+        if isinstance(key, tuple) and key[0] == "mine":
+            i = key[1]
+            if i < len(mine):
+                p["sel"], p["hex"] = ("mine", i), None
+                self.picker_set(mine[i])
+                if double:
+                    self.picker_ok()
+                    return True
+        elif key == "add_mine" and len(mine) < 16:
+            mine.append(p["color"])               # starts as the current color; tweak it
+            self.set_mine(mine)
+            p["sel"], p["hex"] = ("mine", len(mine) - 1), None
+            p["editor"] = True                    # in the editor that opens
+            self.save_mine()
+        elif key == "remove_mine" and self.picker_editing() is not None:
+            del mine[self.picker_editing()]
+            self.set_mine(mine)
+            p["sel"] = None
+            self.save_mine()
+        elif key == "hex":
+            p["hex"] = ""
+        elif key == "done":
+            self.picker_ok()
+            return True
+        return False
+
+    def hex_key(self, name, ch):
+        """Typing a hex code into the simpler picker. True if the key was used."""
+        p = self.picker
+        if name == "Escape":
+            p["hex"] = None
+        elif name in ("Return", "KP_Enter"):
+            t = p["hex"]
+            if len(t) == 3:
+                t = "".join(c * 2 for c in t)
+            if len(t) == 6:
+                self.picker_change("#" + t.lower())
+                if self.picker_editing() is not None:
+                    self.save_mine()
+            p["hex"] = None
+        elif name == "BackSpace":
+            p["hex"] = p["hex"][:-1]
+        elif ch and ch.lower() in "0123456789abcdef" and len(p["hex"]) < 6:
+            p["hex"] += ch.lower()
+        elif ch == "#":
+            pass
+        else:
+            return False
+        self.render_ui()
+        return True
+
+    def draw_picker_modern(self):
+        """Compact palette (click a color = use it). "Fine-tune" opens the editor next to
+        it. The palette never moves and the window never changes size while it's open:
+        everything's position is worked out for the largest layout up front."""
+        p, k = self.picker, self.S
+        PAD, CELL, SW = k(12), k(24), k(18)
+        TB = k(30)
+        LBL = self.line_h(self.f_ui) + k(6)
+        BH = self.line_h(self.f_ui) + k(12)
+        hw = self.hue_w
+        LW = 2 * PAD + 8 * CELL - (CELL - SW)                    # palette column
+        pal_h = LBL + 6 * CELL + k(6) + LBL + 2 * CELL + k(10) + BH
+        # the editor fits in the palette's height, so opening it never makes it taller
+        n = min(self.sv_size, pal_h - (LBL + k(12) + k(34) + k(10) + BH + k(12) + BH))
+        p["sv_n"] = n
+        EW = k(2) + n + k(8) + hw + k(10) + PAD                   # editor column
+        H = TB + k(10) + pal_h + PAD
+        open_ = p.get("editor", False)
+
+        # beside the toolbar, lined up with its bottom; the editor opens on the right
+        W = LW + (EW if open_ else 0)
+        vx, vy, vw, vh = self.vbar
+        mx0, my0, mx1, my1 = self.mon_at(vx + vw / 2, vy + vh / 2)
+        px = vx - k(8) - W if vx - W - k(8) >= mx0 else min(vx + vw + k(8), mx1 - W)
+        ex = px + LW
+        oy = max(my0, min(vy + vh - H, my1 - H))
+        x0, x1 = px, px + W
+
+        s = k(3)
+        self.op("shadow", x0 + s, oy + s, x1 + s, oy + H + s)
+        self.op("rect", x0, oy, x1, oy + H, "#f6f6f6", "#8a8a8a", 1, None)
+        self.hot.append((x0, oy, x1, oy + H, "panel"))
+        self.op("rect", x0 + 1, oy + 1, x1 - 1, oy + TB, "#ffffff", None, 1, None)
+        self.op("text", x0 + PAD, oy + TB / 2, "Color", self.f_ui, "#222222", "w")
+        cw = k(40)
+        if self.hover == "pclose":
+            self.op("rect", x1 - cw, oy + 1, x1 - 1, oy + TB, "#e81123", None, 1, None)
+        self.op("text", x1 - cw / 2, oy + TB / 2, "✕", self.f_ui,
+                "#ffffff" if self.hover == "pclose" else "#222222", "center")
+        self.hot.append((x1 - cw, oy + 1, x1 - 1, oy + TB, "pclose"))
+
+        def cell(x, y, col, key):
+            if key == self.hover:
+                m = k(2)
+                self.op("rect", x - m, y - m, x + SW + m, y + SW + m, None, "#9a9a9a", 1, None)
+            self.op("rect", x, y, x + SW, y + SW, col, "#a0a0a0", 1, None)
+            if open_ and key == p.get("sel"):     # the ONE selected color (editor only)
+                m = k(3)
+                ring = "#0063b1" if key[0] == "mine" else "#000000"
+                self.op("rect", x - m, y - m, x + SW + m, y + SW + m, None, ring, k(2), None)
+            self.hot.append((x - k(2), y - k(2), x + SW + k(2), y + SW + k(2), key))
+
+        # palette column
+        y0 = oy + TB + k(10)
+        y = y0
+        lx = px + PAD
+        self.op("text", lx, y + LBL / 2, "Colors", self.f_ui, "#222222", "w")
+        y += LBL
+        for i, col in enumerate(BASIC_COLORS):
+            cell(lx + (i % 8) * CELL, y + (i // 8) * CELL, col, ("basic", i))
+        y += 6 * CELL + k(6)
+        self.op("text", lx, y + LBL / 2, "My colors", self.f_ui, "#222222", "w")
+        y += LBL
+        mine = self.mine()
+        for j, col in enumerate(mine):
+            cell(lx + (j % 8) * CELL, y + (j // 8) * CELL, col, ("mine", j))
+        if len(mine) < 16:                                       # "+" = make a new color
+            j = len(mine)
+            x, yy = lx + (j % 8) * CELL, y + (j // 8) * CELL
+            bg = HOVER_BG if self.hover == "add_mine" else "#ffffff"
+            self.op("rect", x, yy, x + SW, yy + SW, bg, "#8a8a8a", 1, (2, 2))
+            self.op("text", x + SW / 2, yy + SW / 2, "+", self.f_bold, "#444444", "center")
+            self.hot.append((x - k(2), yy - k(2), x + SW + k(2), yy + SW + k(2), "add_mine"))
+        y += 2 * CELL + k(10)
+        label = "Fine-tune ▸" if not open_ else "◂ Hide"
+        self.dlg_button(lx, y, LW - 2 * PAD, BH, label, "editor")
+
+        if not open_:
+            return
+
+        # editor column
+        editing = self.picker_editing()
+        sx = ex + k(2)
+        sy = y0 + LBL
+        hx = sx + n + k(8)
+        p["sv_at"] = (sx, sy)
+        hue_key = (round(p["h"], 3), n)
+        if self.sv_hue != hue_key:
+            self.sv_surf = pil_surface(sv_square(p["h"], n * self.dev))
+            self.sv_hue = hue_key
+        self.op("text", sx, y0 + LBL / 2,
+                "Editing your color" if editing is not None else "Fine-tune",
+                self.f_ui, "#0063b1" if editing is not None else "#222222", "w")
+        self.op("image", self.sv_surf, sx, sy, n, n)
+        self.op("rect", sx - 1, sy - 1, sx + n, sy + n, None, "#8a8a8a", 1, None)
+        self.hot.append((sx, sy, sx + n, sy + n, "sv"))
+        mx, my = sx + p["s"] * n, sy + (1 - p["v"]) * n
+        r = k(5)
+        self.op("oval", mx, my, r, "#000000", k(2))
+        self.op("oval", mx, my, r - 1, "#ffffff", 1)
+        self.op("image", self.hue_surf, hx, sy, hw, n)
+        self.op("rect", hx - 1, sy - 1, hx + hw, sy + n, None, "#8a8a8a", 1, None)
+        self.hot.append((hx - k(3), sy, hx + hw + k(6), sy + n, "hue"))
+        ty = sy + p["h"] * n
+        self.op("poly", [(hx + hw + 1, ty), (hx + hw + k(7), ty - k(4)),
+                         (hx + hw + k(7), ty + k(4))], "#222222")
+        wide = n + k(8) + hw
+        y2 = sy + n + k(12)
+        self.op("rect", sx, y2, sx + k(48), y2 + k(34), p["color"], "#8a8a8a", 1, None)
+        hx0, hx1 = sx + k(56), sx + wide
+        typing = p.get("hex") is not None
+        self.op("rect", hx0, y2 + k(4), hx1, y2 + k(30),
+                "#ffffff", "#0063b1" if typing else "#adadad", 1, None)
+        text = "#" + (p["hex"].upper() + "|" if typing else p["color"][1:].upper())
+        self.op("text", hx0 + k(8), y2 + k(17), text, self.f_ui,
+                "#222222" if not typing or p["hex"] else "#888888", "w")
+        self.hot.append((hx0, y2 + k(4), hx1, y2 + k(30), "hex"))
+        y3 = y2 + k(34) + k(10)
+        self.dlg_button(sx, y3, wide, BH, "Remove color", "remove_mine",
+                        enabled=editing is not None)             # always there: no jumping
+        by = oy + H - PAD - BH
+        bw = (wide - k(8)) // 2
+        self.dlg_button(sx, by, bw, BH, "Cancel", "cancel")
+        self.dlg_button(sx + bw + k(8), by, bw, BH, "Done", "done")
 
     def picker_set(self, col):
         p = self.picker
@@ -2220,13 +2950,18 @@ class Overlay:
         p["s"], p["v"] = s, v
 
     def picker_ok(self):
+        if not self.picker:
+            return
         self.color = self.picker["color"]
         self.cfg["color"] = self.color
         update_config(color=self.color)
         self.close_picker()
 
     def picker_drag(self, kind, x, y):
-        p, n = self.picker, self.sv_size
+        if not self.picker or "sv_at" not in self.picker:   # closed mid-drag (Esc / Enter)
+            return
+        p = self.picker
+        n = p.get("sv_n", self.sv_size)
         sx0, sy0 = p["sv_at"]
         if kind == "sv":
             p["s"] = min(max((x - sx0) / n, 0), 1)
@@ -2234,6 +2969,8 @@ class Overlay:
         else:
             p["h"] = min(max((y - sy0) / n, 0), 0.999)
         p["color"] = rgb_hex(*[ch * 255 for ch in colorsys.hsv_to_rgb(p["h"], p["s"], p["v"])])
+        if p.get("modern"):
+            self.picker_changed()                 # edits your selected color, live
         self.render_ui()
 
     def dlg_button(self, x, y, w, h, text, key, enabled=True):
@@ -2286,6 +3023,9 @@ class Overlay:
             if col and col.lower() == p["color"].lower():
                 m = k(3)
                 self.op("rect", x - m, y - m, x + SW + m, y + SW + m, None, "#000000", k(2), None)
+            if key == ("custom", self.cfg.get("slot", 0) % 16):
+                m = k(2)          # the box "Add to Custom Colors" will fill (like Windows)
+                self.op("rect", x - m, y - m, x + SW + m, y + SW + m, None, "#0063b1", 1, (2, 2))
             self.hot.append((x - k(2), y - k(2), x + SW + k(2), y + SW + k(2), key))
 
         y = oy + TB + k(8)
@@ -2378,7 +3118,32 @@ class Overlay:
         self.entry = {"x": x, "y": y, "text": text, "caret": len(text),
                       "px": px or self.text_px(self.width), "color": color or self.color,
                       "caret_on": True, "replaces": replaces}
+        self.im_attach(True)
         self.blink()
+
+    def im_attach(self, on):
+        if self.closed:
+            return
+        active = [win for _, win, _, _ in self.key_ctls if win.is_active()]
+        for ctl, win, im, _ in self.key_ctls:
+            if on:
+                ctl.set_im_context(im)
+                if win in active or not active:   # (one input method focus at a time)
+                    im.focus_in()
+            else:
+                im.reset()
+                im.focus_out()
+                ctl.set_im_context(None)
+
+    def _im_commit(self, im, text):
+        t = self.entry
+        if not t or self.closed:
+            return
+        import unicodedata                        # drop control characters only (keeps
+        text = "".join(ch for ch in text if unicodedata.category(ch) != "Cc")  # emoji joiners)
+        i = t["caret"]
+        t["text"], t["caret"], t["caret_on"] = t["text"][:i] + text + t["text"][i:], i + len(text), True
+        self.redraw()
 
     def text_size(self, text, px):
         desc = self.fonts.desc(px, True)
@@ -2489,6 +3254,7 @@ class Overlay:
         if t and t.get("blink"):
             self.after_cancel(t["blink"])
         self.entry = None
+        self.im_attach(False)
         self.redraw()
         return t
 
@@ -2600,8 +3366,12 @@ class Overlay:
         else:
             snap.append_color(dim, R(0, 0, self.sw, self.sh))
         cr = snap.append_cairo(view)                              # drawings + toolbars
-        self.paint(cr)
-        snap.restore()
+        try:
+            self.paint(cr)
+        except Exception as e:                                    # (keep GTK's stack even)
+            log(f"drawing failed: {e}")
+        finally:
+            snap.restore()
 
     def paint(self, cr):
         # drawings: markers first as one see-through layer, then everything else
@@ -2618,7 +3388,24 @@ class Overlay:
                 self.paint_ops(cr, self.item_ops(a))
         if self.entry:
             self.paint_ops(cr, self.typing_ops())
-        self.paint_ops(cr, self.ui_ops)
+        rng = getattr(self, "picker_ops", None) if self.picker else None
+        grow = self.picker_grow() if rng else 1.0
+        if rng and grow < 1.0:                    # opening: fade in + grow from the button
+            a, b = rng
+            self.paint_ops(cr, self.ui_ops[:a])
+            vx, vy, vw, vh = self.vbar
+            cx, cy = vx, vy + vh / 2              # grows out of the toolbar
+            cr.push_group()
+            cr.translate(cx, cy)
+            scale = 0.92 + 0.08 * grow
+            cr.scale(scale, scale)
+            cr.translate(-cx, -cy)
+            self.paint_ops(cr, self.ui_ops[a:b])
+            cr.pop_group_to_source()
+            cr.paint_with_alpha(grow)
+            self.paint_ops(cr, self.ui_ops[b:])
+        else:
+            self.paint_ops(cr, self.ui_ops)
 
         # brush circle / "Aa" preview always on top
         if self.ring:
@@ -2684,7 +3471,7 @@ class Overlay:
                 cr.set_line_width(lw)
                 cr.stroke()
             elif kind == "text":
-                _, x, y, text, desc, col, anchor = o
+                _, x, y, text, desc, col, anchor, *alpha = o
                 lay = PangoCairo.create_layout(cr)
                 lay.set_font_description(desc)
                 lay.set_text(text, -1)
@@ -2694,7 +3481,7 @@ class Overlay:
                 elif anchor == "center":
                     x, y = x - w / 2, y - h / 2
                 cr.move_to(x, y)
-                cr.set_source_rgb(*rgbf(col))
+                cr.set_source_rgba(*rgbf(col), alpha[0] if alpha else 1.0)
                 PangoCairo.show_layout(cr, lay)
                 cr.new_path()
             elif kind == "image":
@@ -2712,20 +3499,31 @@ class Overlay:
         """The selected area at s pixels per desktop unit, from each monitor's own
         pixels (only resampled if the selection spans monitors of different scales)."""
         x0, y0, x1, y1 = sel
-        out = Image.new("RGB", (max(1, round((x1 - x0) * s)), max(1, round((y1 - y0) * s))))
+        # Every edge is placed at round(distance from the selection's corner * s), and
+        # each piece is exactly as wide as the gap between its edges, so a selection on
+        # one monitor is copied pixel for pixel (never resampled), at any scale.
+        ex = lambda v: round((v - x0) * s)
+        ey = lambda v: round((v - y0) * s)
+        out = Image.new("RGB", (max(1, ex(x1)), max(1, ey(y1))))
         for p in self.parts:
             px, py, pw, ph = p["rect"]
             ix0, iy0 = max(x0, px), max(y0, py)
             ix1, iy1 = min(x1, px + pw), min(y1, py + ph)
             if ix1 <= ix0 or iy1 <= iy0:
                 continue
-            ps = p["scale"]
-            piece = p["img"].crop((round((ix0 - px) * ps), round((iy0 - py) * ps),
-                                   round((ix1 - px) * ps), round((iy1 - py) * ps)))
-            size = (round((ix1 - ix0) * s), round((iy1 - iy0) * s))
-            if piece.size != size:
-                piece = piece.resize(size, Image.LANCZOS)
-            out.paste(piece, (round((ix0 - x0) * s), round((iy0 - y0) * s)))
+            w, h = ex(ix1) - ex(ix0), ey(iy1) - ey(iy0)
+            if w < 1 or h < 1:
+                continue
+            ps, im = p["scale"], p["img"]
+            cx, cy = round((ix0 - px) * ps), round((iy0 - py) * ps)
+            if ps == s:                            # same pixels: straight copy
+                cx, cy = min(max(0, cx), im.width - 1), min(max(0, cy), im.height - 1)
+                piece = im.crop((cx, cy, min(cx + w, im.width), min(cy + h, im.height)))
+            else:
+                piece = im.crop((cx, cy, round((ix1 - px) * ps), round((iy1 - py) * ps)))
+            if piece.size != (w, h):
+                piece = piece.resize((w, h), Image.LANCZOS)
+            out.paste(piece, (ex(ix0), ey(iy0)))
         return out
 
     def render(self):
@@ -2769,6 +3567,8 @@ class Overlay:
 
         marks.putalpha(marks.getchannel("A").point(lambda v: v * 45 // 100))
         out = Image.alpha_composite(Image.alpha_composite(base, marks), ink)
+        if self.cfg.get("watermark", True):
+            out = add_watermark(out, s)
         return out.convert("RGB")
 
     def copy(self):
@@ -2815,14 +3615,36 @@ class Overlay:
         return next_file_name(folder, self.cfg)
 
     def write_image(self, img, path, exclusive=False):
+        """Write the screenshot. exclusive: never replace an existing file. Otherwise the
+        file is written next to its final name and swapped in at the end, so a failed
+        save (disk full...) never leaves half a file, and a symlink planted at that name
+        gets replaced instead of written through."""
         if not os.path.splitext(path)[1]:
             path += ".jpg" if self.cfg.get("format") == "jpg" else ".png"
+            exclusive = True           # the dialog only checked the name without it
         fmt = "JPEG" if path.lower().endswith((".jpg", ".jpeg")) else "PNG"
-        with open(path, "xb" if exclusive else "wb") as f:
-            if fmt == "JPEG":
-                img.convert("RGB").save(f, fmt, quality=self.cfg.get("jpg_quality", 95))
-            else:
-                img.save(f, fmt)
+        folder = os.path.dirname(os.path.abspath(path))
+        if exclusive:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+            tmp = None
+        else:
+            import tempfile
+            fd, tmp = tempfile.mkstemp(dir=folder, prefix=".snypshot-")
+            os.fchmod(fd, 0o644 & ~current_umask())
+        try:
+            with os.fdopen(fd, "wb") as f:
+                if fmt == "JPEG":
+                    img.convert("RGB").save(f, fmt, quality=self.cfg.get("jpg_quality", 95))
+                else:
+                    img.save(f, fmt)
+            if tmp:
+                os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp or path)
+            except OSError:
+                pass
+            raise
         self.cfg["last_dir"] = os.path.dirname(os.path.abspath(path))
         update_config(last_dir=self.cfg["last_dir"])
         return path
@@ -2842,10 +3664,12 @@ class Overlay:
                 break
             except FileExistsError:
                 continue
-            except OSError as e:
+            except (OSError, ValueError) as e:
                 notify(f"Couldn't save: {e}")
                 return
         else:
+            notify(f"Couldn't save: too many files named like {self.next_name(folder)} "
+                   f"appeared in {folder} at once")
             return
         if self.cfg.get("notify", True):
             notify(f"Saved as {os.path.basename(path)} in {folder}")
@@ -2887,6 +3711,11 @@ class Overlay:
                 return
             try:
                 path = self.write_image(img, path)
+            except FileExistsError as e:
+                notify(f"{os.path.basename(e.filename or path)} already exists. "
+                       "Pick another name.")
+                self.back_from_dialog()
+                return
             except (OSError, ValueError) as e:
                 notify(f"Couldn't save: {e}")
                 self.back_from_dialog()
@@ -2932,19 +3761,581 @@ class Overlay:
             return False
         GLib.timeout_add(120, show)
 
+    def print_dialog(self):
+        """The Print button: snypshot's own simple print window (like Chrome's: a preview,
+        where to print, copies, layout, color). Like saving, the screenshot steps aside
+        meanwhile and Cancel brings it back."""
+        if self.closed or not self.sel or self.drag or self.dialog_open:
+            return
+        if self.entry:
+            self.commit_text()
+        img = self.render()
+        folder = self.save_folder()
+        pdf_name = os.path.splitext(self.next_name(folder))[0] + ".pdf"
+        self.dialog_open = True
+        self.dialog_win = None
+        self.ring = None
+        self.let_go()                              # hide the overlay while printing
+
+        def finish(win, done):
+            if self.dialog_win is not win:
+                return
+            self.dialog_win = None
+            self.dialog_open = False
+            win.destroy()
+            if self.closed:
+                return
+            self.close() if done else self.back_from_dialog()
+
+        def show():                                # once the screenshot is off screen
+            if self.closed or not self.dialog_open:
+                return False
+            try:
+                win = PrintWindow(img, folder, pdf_name, finish)
+                self.dialog_win = win
+                win.present()
+            except Exception as e:
+                import traceback
+                log("print window failed:\n" + traceback.format_exc())
+                self.dialog_open = False
+                self.dialog_win = None
+                self.back_from_dialog()
+                notify(f"Couldn't open the print window ({e}).")
+            return False
+        GLib.timeout_add(120, show)
+
     def back_from_dialog(self):
         self.take_focus()
         self.set_cursor("crosshair")
         self.render_ui()
 
+    def dialog_window(self):
+        """The open save or print dialog window, if any."""
+        return getattr(self, "dialog_win", None)
+
     def cancel_dialog(self):
-        dlg = getattr(self, "dialog_win", None)
+        dlg = self.dialog_window()
         if dlg is not None:
             dlg.response(Gtk.ResponseType.CANCEL)
         elif self.dialog_open:                     # not shown yet
             self.dialog_open = False
             if not self.closed:
                 self.back_from_dialog()
+
+
+# ---------------------------------------------------------------- printing
+
+PRINT_CSS = b"""
+.snyp-print-preview { background: alpha(currentColor, 0.08); }
+.snyp-print-side { padding: 20px 22px; }
+.snyp-print-title { font-size: 1.5em; font-weight: bold; }
+.snyp-print-label { opacity: 0.8; }
+"""
+PDF_DEST = "Save as PDF"
+_print_css = False
+
+
+def draw_page(cr, pw, ph, img, landscape, fit, gray, unit=1.0):
+    """Lay the screenshot out on a page pw x ph (points): half-inch margins, centered at
+    the top; as big as on screen (96 dpi) or, with fit, as big as the page allows."""
+    import math
+    import cairo as C
+    cr.save()
+    cr.set_source_rgb(1, 1, 1)
+    cr.paint()
+    if landscape:                                  # sideways on the upright paper, top on
+        cr.translate(0, ph)                        # the left (the usual way, like GTK's)
+        cr.rotate(-math.pi / 2)
+        pw, ph = ph, pw
+    m = 36
+    im = img.convert("L").convert("RGBA") if gray else img.convert("RGBA")
+    s = min((pw - 2 * m) / im.width, (ph - 2 * m) / im.height)
+    if not fit:                                    # (unit: img is a smaller copy)
+        s = min(s, 72 / 96 / unit)
+    cr.translate((pw - im.width * s) / 2, m)
+    cr.scale(s, s)
+    cr.set_source_surface(pil_surface(im), 0, 0)
+    cr.get_source().set_filter(C.FILTER_GOOD)
+    cr.paint()
+    cr.restore()
+
+
+def printer_list():
+    """(printer names, default name) from CUPS, the Linux print system."""
+    if not have("lpstat"):
+        return [], None
+    try:
+        names = subprocess.run([T("lpstat"), "-e"], capture_output=True, text=True,
+                               env=clean_env(), timeout=5).stdout.split()
+        d = subprocess.run([T("lpstat"), "-d"], capture_output=True, text=True,
+                           env=clean_env(), timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return [], None
+    names = list(dict.fromkeys(n for n in names if CUPS_NAME.fullmatch(n)))[:100]
+    default = d.rsplit(":", 1)[-1].strip() if ":" in d else None
+    return names, default if default in names else None
+
+
+CUPS_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.@+:-]{0,126}")   # printer names
+CUPS_KEY = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}")              # option names
+CUPS_WORD = re.compile(r"[A-Za-z0-9_.+-]{1,63}")                    # option values
+
+
+def clean_label(text, limit=60):
+    """Printer-supplied text for a label: printable, no direction tricks, not huge."""
+    text = "".join(ch for ch in text if ch.isprintable() and not
+                   ("\u202a" <= ch <= "\u202e" or "\u2066" <= ch <= "\u2069"))
+    return text[:limit].strip()
+
+
+def printer_options(name):
+    """This printer's own settings, straight from CUPS (whatever the printer has: paper,
+    two-sided, quality, trays...): [(key, label, [values], default)]."""
+    if not have("lpoptions"):
+        return []
+    try:
+        out = subprocess.run([T("lpoptions"), "-p", name, "-l"], capture_output=True,
+                             text=True, env=clean_env(), timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    opts, seen = [], set()
+    for line in out.splitlines()[:200]:
+        head, sep, rest = line.rpartition(": ")
+        key, _, label = head.partition("/")
+        if not sep or key in seen or not CUPS_KEY.fullmatch(key):
+            continue
+        vals = rest.split()[:300]
+        default = next((v[1:] for v in vals if v.startswith("*")), None)
+        vals = list(dict.fromkeys(v.lstrip("*") for v in vals))
+        vals = [v for v in vals if CUPS_WORD.fullmatch(v) and not v.startswith("Custom.")][:100]
+        if len(vals) > 1:
+            seen.add(key)
+            # (default None: the printer's own default isn't one we can show, so
+            # whatever you pick is always sent)
+            opts.append((key, clean_label(label) or key, vals,
+                         default if default in vals else None))
+    return opts
+
+
+def nice_value(v):
+    """"DuplexNoTumble" -> "Duplex No Tumble", "None" -> "Off"."""
+    if v in ("None", "none", "off", "Off"):
+        return "Off"
+    return re.sub(r"(?<=[a-z])(?=[A-Z])|_", " ", v)
+
+
+PDF_PAPERS = ["Letter", "A4", "Legal"]
+
+
+class PrintWindow:
+    """A simple print window like Chrome's: preview on the left; destination, copies,
+    paper, layout, color and size on the right, and under "More settings" whatever
+    else the chosen printer offers (read from the printer, not hard-coded). Printing
+    goes through CUPS (lp) with a PDF snypshot draws itself."""
+
+    def __init__(self, img, folder, pdf_name, on_finish):
+        self.win = Gtk.Window(title="Print")
+        self.img, self.folder, self.pdf_name, self.on_finish = img, folder, pdf_name, on_finish
+        self.busy = False
+        self.chooser = None
+        self.gen = 0                               # which destination a result is for
+        self.extra = {}                            # CUPS option -> (DropDown, values, default)
+        # A smaller copy for the preview (and its black and white version), made once.
+        small = img.copy()
+        small.thumbnail((1600, 1600))
+        self.small = {False: small.convert("RGBA"), True: small.convert("L").convert("RGBA")}
+        self.small_scale = small.width / img.width
+        self.win.set_default_size(960, 660)
+        global _print_css
+        if not _print_css:                         # (once per run)
+            _print_css = True
+            css = Gtk.CssProvider()
+            css.load_from_data(PRINT_CSS, len(PRINT_CSS))
+            Gtk.StyleContext.add_provider_for_display(self.win.get_display(), css,
+                                                      Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        self.win.set_child(root)
+        self.preview = Gtk.Picture()
+        self.preview.set_can_shrink(True)
+        for side_ in ("top", "bottom", "start", "end"):
+            getattr(self.preview, f"set_margin_{side_}")(24)
+        self.preview.set_hexpand(True)
+        self.preview.set_vexpand(True)
+        pbox = Gtk.Box()
+        pbox.add_css_class("snyp-print-preview")
+        pbox.set_hexpand(True)
+        pbox.append(self.preview)
+        root.append(pbox)
+
+        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        side.add_css_class("snyp-print-side")
+        side.set_size_request(360, -1)
+        root.append(side)
+        title = Gtk.Label(label="Print", xalign=0)
+        title.add_css_class("snyp-print-title")
+        side.append(title)
+        self.sheets = Gtk.Label(label="1 sheet of paper", xalign=0)
+        self.sheets.add_css_class("snyp-print-label")
+        side.append(self.sheets)
+
+        scroll = Gtk.ScrolledWindow(vexpand=True)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        side.append(scroll)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_margin_top(8)
+        scroll.set_child(box)
+        self.grid = grid = Gtk.Grid(row_spacing=12, column_spacing=16)
+        box.append(grid)
+        self.rows = 0
+
+        self.dest_names = [PDF_DEST]
+        self.dest_model = Gtk.StringList.new(self.dest_names)
+        self.dest = Gtk.DropDown(model=self.dest_model)
+        self.row("Destination", self.dest)
+        self.copies = Gtk.SpinButton.new_with_range(1, 99, 1)
+        self.copies_row = self.row("Copies", self.copies)
+        self.paper_dd = Gtk.DropDown.new_from_strings(["Letter"])
+        self.papers = ["Letter"]
+        self.row("Paper", self.paper_dd)
+        self.layout = Gtk.DropDown.new_from_strings(["Portrait", "Landscape"])
+        self.layout.set_selected(1 if img.width > img.height else 0)
+        self.row("Layout", self.layout)
+        self.color = Gtk.DropDown.new_from_strings(["Color", "Black and white"])
+        self.row("Color", self.color)
+        self.size = Gtk.DropDown.new_from_strings(["Actual size", "Fit to page"])
+        self.row("Size", self.size)
+
+        self.more = Gtk.Expander(label="More settings")
+        self.more_grid = Gtk.Grid(row_spacing=12, column_spacing=16)
+        self.more_grid.set_margin_top(12)
+        self.more.set_child(self.more_grid)
+        box.append(self.more)
+
+        self.status = Gtk.Label(xalign=0, wrap=True)
+        self.status.add_css_class("snyp-print-label")
+        side.append(self.status)
+        buttons = Gtk.Box(spacing=10, halign=Gtk.Align.END)
+        cancel = Gtk.Button(label="Cancel")
+        cancel.connect("clicked", lambda *_: self.response(Gtk.ResponseType.CANCEL))
+        self.go = Gtk.Button(label="Save")
+        self.go.add_css_class("suggested-action")
+        self.go.connect("clicked", lambda *_: self.response(Gtk.ResponseType.OK))
+        buttons.append(cancel)
+        buttons.append(self.go)
+        side.append(buttons)
+
+        self.dest.connect("notify::selected", lambda *_: self.dest_changed())
+        for w in (self.paper_dd, self.layout, self.color, self.size):
+            w.connect("notify::selected", lambda *_: self.update())
+        self.copies.connect("value-changed", lambda *_: self.update())
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self._key)
+        self.win.add_controller(keys)
+        self.win.connect("close-request",
+                         lambda *_: self.response(Gtk.ResponseType.CANCEL) or True)
+        self.win.set_default_widget(self.go)
+        self.dest_changed()
+        self.picked = False                        # you chose a destination yourself
+        self.in_background(printer_list, self.got_printers)   # (CUPS can be slow)
+
+    def in_background(self, work, done):
+        """Run work() off the main loop (CUPS commands can take seconds), then done(result)
+        back on it - unless the window is gone by then."""
+        import threading
+
+        def run():
+            try:
+                result = work()
+            except Exception as e:
+                log(f"print: {e}")
+                result = None
+            GLib.idle_add(lambda: (None if self.win is None else done(result)) and False)
+        threading.Thread(target=run, daemon=True).start()
+
+    def got_printers(self, result):
+        names, default = result or ([], None)
+        for n in names:
+            self.dest_names.append(n)
+            self.dest_model.append(n)
+        if default and not self.picked:            # (never override your own choice)
+            self.auto = True
+            self.dest.set_selected(self.dest_names.index(default))
+            self.auto = False
+
+    def row(self, text, widget, grid=None):
+        grid = grid or self.grid
+        n = self.rows if grid is self.grid else len(self.extra)
+        lab = Gtk.Label(label=text, xalign=0)
+        lab.add_css_class("snyp-print-label")
+        lab.set_wrap(True)
+        lab.set_max_width_chars(14)
+        widget.set_hexpand(True)
+        grid.attach(lab, 0, n, 1, 1)
+        grid.attach(widget, 1, n, 1, 1)
+        if grid is self.grid:
+            self.rows += 1
+        return lab
+
+    def present(self):
+        if self.win is not None:
+            self.win.present()
+
+    def destroy(self):
+        if self.chooser is not None:
+            self.chooser.destroy()
+            self.chooser = None
+        if self.win is not None:
+            self.preview.set_paintable(None)
+            self.win.destroy()
+        self.win = None                            # let go of the screenshot
+        self.img = self.small = self.on_finish = None
+        self.extra = {}
+
+    def get_mapped(self):
+        return self.win is not None and self.win.get_mapped()
+
+    def dest_name(self):
+        i = self.dest.get_selected()
+        return self.dest_names[i] if 0 <= i < len(self.dest_names) else PDF_DEST
+
+    def dest_changed(self):
+        """New destination: its papers and its own settings (asked from CUPS in the
+        background; the window stays usable meanwhile)."""
+        self.gen += 1
+        if not getattr(self, "auto", False):
+            self.picked = True
+        gen, name = self.gen, self.dest_name()
+        if name == PDF_DEST:
+            self.show_options([])
+            return
+        self.status.set_label("Getting the printer's settings...")
+        self.go.set_sensitive(False)
+
+        def done(opts):
+            if gen == self.gen:                    # still the chosen printer
+                self.go.set_sensitive(True)
+                self.show_options(opts or [])
+        self.in_background(lambda: printer_options(name), done)
+
+    def show_options(self, opts):
+        page = next((o for o in opts if o[0] == "PageSize"), None)
+        if page:
+            papers, current = page[2], page[3] or page[2][0]
+        else:
+            locale_default = Gtk.PaperSize.get_default()
+            papers = PDF_PAPERS
+            current = "A4" if "a4" in locale_default.lower() else "Letter"
+        self.papers = papers
+        self.paper_dd.set_model(Gtk.StringList.new([nice_value(p) for p in papers]))
+        self.paper_dd.set_selected(papers.index(current) if current in papers else 0)
+        while (child := self.more_grid.get_first_child()) is not None:
+            self.more_grid.remove(child)
+        self.extra = {}
+        for key, label, vals, default in opts:
+            if key == "PageSize":
+                continue
+            dd = Gtk.DropDown.new_from_strings([clean_label(nice_value(v)) for v in vals])
+            dd.set_selected(vals.index(default) if default in vals else 0)
+            self.row(label, dd, grid=self.more_grid)
+            self.extra[key] = (dd, vals, default)
+        self.more.set_visible(bool(self.extra))
+        self.update()
+
+    def paper(self):
+        """The chosen paper as a Gtk.PaperSize (standard names are known to GTK)."""
+        i = self.paper_dd.get_selected()
+        name = self.papers[i] if 0 <= i < len(self.papers) else "Letter"
+        m = re.fullmatch(r"w(\d+(?:\.\d+)?)h(\d+(?:\.\d+)?)", name.split(".")[0])
+        if m:                                      # "w288h432": a size in points
+            w, h = (min(max(float(v), 72), 5000) for v in m.groups())
+            return Gtk.PaperSize.new_custom(name, name, w, h, Gtk.Unit.POINTS)
+        base = name.split(".")[0]                  # "Letter.Fullbleed" -> "Letter"
+        p = Gtk.PaperSize.new_from_ppd(base, base, 0, 0)
+        if not (72 <= p.get_width(Gtk.Unit.POINTS) <= 5000
+                and 72 <= p.get_height(Gtk.Unit.POINTS) <= 5000):
+            p = Gtk.PaperSize.new(Gtk.PaperSize.get_default())
+        return p
+
+    # --- preview
+
+    def options(self):
+        return dict(landscape=self.layout.get_selected() == 1,
+                    fit=self.size.get_selected() == 1,
+                    gray=self.color.get_selected() == 1)
+
+    def update(self):
+        pdf = self.dest_name() == PDF_DEST
+        self.go.set_label("Save" if pdf else "Print")
+        self.copies.set_visible(not pdf)
+        self.copies_row.set_visible(not pdf)
+        n = 1 if pdf else int(self.copies.get_value())
+        self.sheets.set_label(f"{n} sheet{'s' if n > 1 else ''} of paper")
+        self.status.set_label("")
+        o = self.options()
+        import cairo as C
+        paper = self.paper()
+        pw, ph = paper.get_width(Gtk.Unit.POINTS), paper.get_height(Gtk.Unit.POINTS)
+        vw, vh = (ph, pw) if o["landscape"] else (pw, ph)
+        k = min(2.0, 1400 / max(vw, vh))           # preview pixels per point
+        surf = C.ImageSurface(C.FORMAT_RGB24, round(vw * k), round(vh * k))
+        cr = C.Context(surf)
+        cr.scale(k, k)
+        if o["landscape"]:                         # show it the way you'll hold the paper
+            import math
+            cr.translate(vw, 0)
+            cr.rotate(math.pi / 2)
+        draw_page(cr, pw, ph, self.small[o["gray"]], landscape=o["landscape"], fit=o["fit"],
+                  gray=False, unit=self.small_scale)
+        surf.flush()
+        buf = io.BytesIO()
+        surf.write_to_png(buf)
+        self.preview.set_paintable(Gdk.Texture.new_from_bytes(GLib.Bytes.new(buf.getvalue())))
+
+    # --- doing it
+
+    def _key(self, ctl, keyval, keycode, state):
+        if Gdk.keyval_name(keyval) == "Escape":
+            self.response(Gtk.ResponseType.CANCEL)
+            return True
+        return False
+
+    def response(self, resp):
+        if self.win is None:
+            return
+        if resp != Gtk.ResponseType.OK:            # (also closes a Save as PDF window)
+            self.on_finish(self, False)
+        elif self.busy:
+            return
+        elif self.dest_name() == PDF_DEST:
+            self.save_pdf()
+        else:
+            self.send_to_printer()
+
+    def write_pdf(self, path, wide_page):
+        """Draw the page into a PDF. wide_page: landscape as a wide page (for a PDF you
+        keep); otherwise sideways on upright paper (what printers expect)."""
+        import cairo as C
+        paper = self.paper()
+        pw, ph = paper.get_width(Gtk.Unit.POINTS), paper.get_height(Gtk.Unit.POINTS)
+        o = self.options()
+        if wide_page and o["landscape"]:
+            pw, ph = ph, pw
+            o["landscape"] = False
+        surf = C.PDFSurface(path, pw, ph)
+        cr = C.Context(surf)
+        draw_page(cr, pw, ph, self.img, **o)
+        cr.show_page()
+        surf.finish()
+
+    def send_to_printer(self):
+        name = self.dest_name()
+        if not have("lp") or not CUPS_NAME.fullmatch(name):
+            self.status.set_label("Can't print: the print system (CUPS) isn't installed.")
+            return
+        cmd = [T("lp"), "-d", name, "-n", str(int(self.copies.get_value())),
+               "-t", "snypshot screenshot"]
+        i = self.paper_dd.get_selected()
+        if 0 <= i < len(self.papers):
+            cmd += ["-o", f"PageSize={self.papers[i]}"]
+        for key, (dd, vals, default) in self.extra.items():
+            v = vals[dd.get_selected()] if 0 <= dd.get_selected() < len(vals) else None
+            if v is not None and v != default:
+                cmd += ["-o", f"{key}={v}"]
+        try:
+            import tempfile
+            fd, tmp = tempfile.mkstemp(dir=private_dir(), prefix="print-", suffix=".pdf")
+            os.close(fd)
+            self.write_pdf(tmp, wide_page=False)
+        except Exception as e:
+            try:
+                os.remove(tmp)
+            except (OSError, NameError):
+                pass
+            log(f"printing failed: {e}")
+            self.status.set_label(f"Couldn't print: {e}")
+            return
+        self.busy = True
+        self.go.set_sensitive(False)
+        self.status.set_label("Sending to the printer...")
+
+        def work():
+            try:
+                return subprocess.run(cmd + ["--", tmp], capture_output=True, text=True,
+                                      env=clean_env(), timeout=60)
+            except (OSError, subprocess.TimeoutExpired) as e:
+                return str(e)
+            finally:
+                try:
+                    os.remove(tmp)                 # lp has its own copy by now
+                except OSError:
+                    pass
+
+        def done(r):
+            self.busy = False
+            self.go.set_sensitive(True)
+            if not isinstance(r, subprocess.CompletedProcess) or r.returncode != 0:
+                err = (r.stderr.strip() or r.stdout.strip()) if isinstance(
+                    r, subprocess.CompletedProcess) else str(r)
+                log(f"printing failed: {err}")
+                self.status.set_label(f"Couldn't print: {clean_label(err, 200)}")
+                return
+            log(f"print: sent to {name} ({clean_label(r.stdout, 100)})")
+            self.on_finish(self, True)
+        self.in_background(work, done)
+
+    def save_pdf(self):
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")        # FileChooserDialog is "deprecated"
+            dlg = Gtk.FileChooserDialog(title="Save as PDF", transient_for=self.win,
+                                        modal=True, action=Gtk.FileChooserAction.SAVE)
+            dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+            dlg.add_button("Save", Gtk.ResponseType.ACCEPT)
+            dlg.set_default_response(Gtk.ResponseType.ACCEPT)
+            try:
+                dlg.set_current_folder(Gio.File.new_for_path(self.folder))
+            except GLib.Error:
+                pass
+            dlg.set_current_name(self.pdf_name)
+        self.busy = True
+        self.chooser = dlg
+
+        def chosen(d, resp):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                f = d.get_file() if resp == Gtk.ResponseType.ACCEPT else None
+            d.destroy()
+            self.chooser = None
+            self.busy = False
+            path = f.get_path() if f else None
+            if not path or self.win is None:
+                return                             # back to the print window
+            if not path.lower().endswith(".pdf"):
+                path += ".pdf"                     # (the save window didn't check this name)
+                if os.path.lexists(path):
+                    self.status.set_label(f"{os.path.basename(path)} already exists. "
+                                          "Pick another name.")
+                    return
+            try:
+                import tempfile
+                fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".snypshot-",
+                                           suffix=".pdf")
+                os.close(fd)
+                try:
+                    self.write_pdf(tmp, wide_page=True)
+                    os.chmod(tmp, 0o644 & ~current_umask())
+                    os.replace(tmp, path)
+                except BaseException:
+                    os.unlink(tmp)
+                    raise
+            except Exception as e:
+                self.status.set_label(f"Couldn't save the PDF: {e}")
+                return
+            notify(f"Saved to {path}")
+            self.on_finish(self, True)
+        dlg.connect("response", chosen)
+        dlg.present()
 
 
 # ---------------------------------------------------------------- preferences
@@ -2964,7 +4355,8 @@ entry.snyp-bad { outline: 2px solid #c01c28; }
 """
 
 KEY_ACTIONS = [("copy", "Copy to clipboard"), ("save", "Quick save"),
-               ("save_as", "Save as (opens the save dialog)"), ("undo", "Undo"), ("redo", "Redo")]
+               ("save_as", "Save as (opens the save dialog)"), ("print", "Print"),
+               ("undo", "Undo"), ("redo", "Redo")]
 
 
 def mods_mask():
@@ -3130,6 +4522,8 @@ class Preferences:
         self.quality.connect("value-changed",
                              lambda w: self.set(jpg_quality=int(w.get_value())))
         self.row(g, "JPG quality", self.quality)
+        self.row(g, "Watermark", self.switch("watermark"),
+                 "A small \u201cScreenshot taken with snypshot\u201d in the bottom-right corner")
         self.preview = Gtk.Label(xalign=0)
         self.preview.add_css_class("snyp-note")
         pg.append(self.preview)
@@ -3161,6 +4555,8 @@ class Preferences:
         dim.connect("value-changed", lambda w: self.set(dim=round(w.get_value()) / 100))
         self.row(g, "Darken outside the selection", dim)
         self.row(g, "Size label", self.switch("show_size"), "The 800x600 above the selection")
+        self.row(g, "Classic color window", self.switch("classic_picker"),
+                 "The Lightshot / Windows style color dialog instead of the simpler one")
         ui = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 75, 200, 5)
         ui.set_value(round((cfg["ui_scale"] or 1.0) * 100))
         ui.set_size_request(220, -1)
@@ -3236,7 +4632,21 @@ class Preferences:
         self.stop_recording(cancel=True)
         if is_global:
             suspend_hotkeys()                      # so the key reaches us
-        self.recording = (btn, on_done, is_global, btn.get_label())
+        self.recording = rec = (btn, on_done, is_global, btn.get_label())
+        if is_global:                             # (KDE switches off ALL shortcuts meanwhile,
+            def give_up():                         # so don't leave it like that for long)
+                if self.recording is rec:
+                    self.stop_recording(cancel=True)
+                    self.say("Stopped waiting for a key. Click the button to try again.")
+                return False
+            GLib.timeout_add_seconds(15, give_up)
+            if not getattr(self, "_focus_hooked", False):
+                self._focus_hooked = True
+                def focus(w, _p):
+                    if not w.is_active() and self.recording:
+                        self.stop_recording(cancel=True)
+                        self.say("Stopped waiting for a key. Click the button to try again.")
+                self.win.connect("notify::is-active", focus)
         btn.set_label("Press keys...")
         btn.add_css_class("snyp-recording")
         self.say("Press the new shortcut. Backspace turns it off, Esc cancels.")
@@ -3268,13 +4678,18 @@ class Preferences:
         if name == "BackSpace" and not mods:
             accel = ""
         else:
+            ch = Gdk.keyval_to_unicode(keyval)
+            if ch > 127:                           # e.g. Cyrillic: record the key as it is
+                ok, base, *_ = self.win.get_display().translate_key(keycode, 0, 0)
+                if ok and 0 < Gdk.keyval_to_unicode(base) < 128:   # on the main layout
+                    keyval = base
             accel = Gtk.accelerator_name(Gdk.keyval_to_lower(keyval), mods)
             plain = not mods & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK
                                 | Gdk.ModifierType.SUPER_MASK)
-            ch = Gdk.keyval_to_unicode(keyval)
-            if is_global and plain and ch and chr(ch).isprintable():
-                self.say("Add Ctrl, Alt or Super to that key, or it would fire while you type.",
-                         bad=True)
+            if is_global and plain and not re.fullmatch(
+                    r"Print|Pause|Scroll_Lock|F\d{1,2}|XF86\w+", Gdk.keyval_name(keyval) or ""):
+                self.say("On its own that key would fire all the time. Use Print Screen, an "
+                         "F key, or add Ctrl, Alt or Super.", bad=True)
                 return True
         self.stop_recording()
         btn.set_label(accel_label(accel))
@@ -3282,7 +4697,12 @@ class Preferences:
         return True
 
     def set_hotkey(self, accel, take=False):
-        other = apply_hotkey(accel, take=take)
+        try:
+            other = apply_hotkey(accel, take=take)
+        except (ValueError, RuntimeError) as e:
+            self.hotkey_btn.set_label(accel_label(self.cfg["hotkey"]))
+            self.say(str(e), bad=True)
+            return
         if other:
             self.hotkey_btn.set_label(accel_label(self.cfg["hotkey"]))
             dlg = Gtk.AlertDialog(message=f"“{other}” already uses {accel_label(accel)}",
@@ -3322,10 +4742,16 @@ class Preferences:
             b.set_label(accel_label(self.cfg["keys"][a]))
 
     def reset(self, *_):
+        self.stop_recording(cancel=True)          # give the screenshot keys back first
         keep = {k: self.cfg[k] for k in ("color", "width", "custom", "slot", "last_dir",
                                           "allow_portal")}
         save_config({**json.loads(json.dumps(DEFAULTS)), **keep})
-        apply_hotkey(DEFAULTS["hotkey"], take=True)
+        for k in SHELL_SHOT_KEYS:                 # GNOME's own screenshot keys as they came
+            gset("reset", SHELL_KEYS, k)
+        try:
+            apply_hotkey(DEFAULTS["hotkey"], take=True)
+        except (ValueError, RuntimeError) as e:
+            log(f"reset: couldn't set the shortcut: {e}")
         self.daemon.set_tray(True)
         self.win.destroy()
         self.daemon.prefs = None
@@ -3340,9 +4766,359 @@ class Preferences:
         self.win.present()
 
 
+# ---------------------------------------------------------------- KDE Plasma
+
+# KDE's shortcut service tells the background copy directly when you press the key
+# (no program gets launched, so nothing flashes in the taskbar).
+KDE_ACTION = ["io.github.snypshot", "screenshot", "snypshot", "Take a screenshot"]
+KDE_OLD_ACTION = ["snypshot.desktop", "capture"]   # 1.1 test builds used this; removed
+SPECTACLE = "org.kde.spectacle.desktop"
+QT_MODS = {"shift": 0x02000000, "control": 0x04000000, "primary": 0x04000000,
+           "alt": 0x08000000, "super": 0x10000000, "meta": 0x10000000}
+QT_KEYS = {"Print": 0x01000009, "Pause": 0x01000008, "Scroll_Lock": 0x01000026,
+           "Insert": 0x01000006, "Delete": 0x01000007, "Home": 0x01000010,
+           "End": 0x01000011, "Page_Up": 0x01000016, "Page_Down": 0x01000017,
+           "Left": 0x01000012, "Up": 0x01000013, "Right": 0x01000014, "Down": 0x01000015,
+           "Tab": 0x01000001, "Return": 0x01000004, "space": 0x20, "Escape": 0x01000000,
+           "BackSpace": 0x01000003, "minus": 0x2d, "equal": 0x3d, "comma": 0x2c,
+           "period": 0x2e, "slash": 0x2f, "semicolon": 0x3b, "apostrophe": 0x27,
+           "bracketleft": 0x5b, "bracketright": 0x5d, "backslash": 0x5c, "grave": 0x60}
+
+
+def accel_to_qt(accel):
+    """GTK accelerator ("<Shift>Print") -> Qt key code for KDE's shortcut service."""
+    if not accel:
+        return 0
+    mods = re.findall(r"<(\w+)>", accel)
+    name = re.sub(r"<\w+>", "", accel)
+    code = sum(QT_MODS.get(m.lower(), 0) for m in mods)
+    if re.fullmatch(r"F([1-9]|[12]\d|3[0-5])", name):
+        return code + 0x01000030 + int(name[1:]) - 1
+    if name in QT_KEYS:
+        return code + QT_KEYS[name]
+    if re.fullmatch(r"[A-Za-z0-9]", name):
+        return code + ord(name.upper())
+    raise ValueError("That key can't be used as a shortcut on KDE yet.")
+
+
+def qt_to_accel(code):
+    if not code:
+        return ""
+    mods = "".join(f"<{m}>" for m, v in (("Shift", 0x02000000), ("Control", 0x04000000),
+                                        ("Alt", 0x08000000), ("Super", 0x10000000))
+                   if code & v)
+    key = code & 0x01FFFFFF
+    names = {v: k for k, v in QT_KEYS.items()}
+    if 0x01000030 <= key < 0x01000030 + 35:
+        name = f"F{key - 0x01000030 + 1}"
+    elif key in names:
+        name = names[key]
+    elif 0x30 <= key <= 0x39 or 0x41 <= key <= 0x5A:
+        name = chr(key).lower()
+    else:
+        return None
+    return mods + name
+
+
+def kga(method, sig=None, args=None, reply=None, path="/kglobalaccel",
+        iface="org.kde.KGlobalAccel"):
+    """Call KDE's global shortcut service (kglobalaccel). Errors become RuntimeError."""
+    from gi.repository import Gio, GLib as G
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        res = bus.call_sync("org.kde.kglobalaccel", path, iface, method,
+                            G.Variant(sig, args) if sig else None,
+                            G.VariantType(reply) if reply else None, Gio.DBusCallFlags.NONE,
+                            3000, None)
+    except G.Error as e:
+        raise RuntimeError(f"KDE's shortcut service: {e.message}") from None
+    except (TypeError, ValueError, OverflowError) as e:
+        raise RuntimeError(f"KDE's shortcut service: bad value ({e})") from None
+    return res.unpack() if res is not None else None
+
+
+def first_qt(keys):
+    """First key of a KDE shortcut list ([([k1, k2, k3, k4],), ...]) or 0."""
+    try:
+        return int(keys[0][0][0])
+    except (IndexError, TypeError, ValueError):
+        return 0
+
+
+def kde_owners(qt):
+    """Other shortcuts on this key: [(actionId list, friendly name)]."""
+    out = []
+    for (uname, fname, comp, cfname, ctx, cxf, keys, dflt) in kga(
+            "globalShortcutsByKey", "((ai)(i))", (([qt, 0, 0, 0],), (0,)),
+            "(a(ssssssaiai))")[0]:
+        if comp not in (KDE_ACTION[0], KDE_OLD_ACTION[0]):
+            out.append(([comp, uname, cfname, fname], f"{cfname}: {fname}"))
+    return out
+
+
+def kde_apply_hotkey(accel, take=False):
+    """KDE version of apply_hotkey (same contract)."""
+    qt = accel_to_qt(accel)
+    if qt:
+        for aid, name in kde_owners(qt):
+            if aid[0] != SPECTACLE and not take:
+                return name
+            if aid[0] == SPECTACLE:                # remember it, to give it back later
+                taken = kde_taken_load()
+                if [aid[1], qt] not in taken:
+                    kde_taken_save(taken + [[aid[1], qt]])
+            kga("setForeignShortcutKeys", "(asa(ai))", (aid, [([0, 0, 0, 0],)]))
+    kga("doRegister", "(as)", (KDE_ACTION,))
+    got = kga("setShortcutKeys", "(asa(ai)u)", (KDE_ACTION, [([qt, 0, 0, 0],)], 2 | 4),
+              "(a(ai))")[0]
+    if qt and first_qt(got) != qt:
+        raise RuntimeError("KDE didn't accept that shortcut.")
+    update_config(hotkey=accel or "")
+    try:
+        kde_restore_spectacle()                    # e.g. Print, if you moved off it
+    except RuntimeError:
+        pass
+    return None
+
+
+KDE_TAKEN = os.path.join(os.path.dirname(CONFIG), "kde-spectacle-keys.json")
+
+
+def kde_taken_load():
+    """Spectacle keys snypshot took: [[action, key], ...]."""
+    try:
+        with open(KDE_TAKEN) as f:
+            data = json.load(f)
+        return [[a, k] for a, k in data if isinstance(a, str) and len(a) < 100
+                and isinstance(k, int) and not isinstance(k, bool) and 0 < k < 2 ** 31][:50]
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def kde_taken_save(items):
+    try:
+        os.makedirs(os.path.dirname(KDE_TAKEN), exist_ok=True)
+        import tempfile
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(KDE_TAKEN), prefix=".kde-")
+        with os.fdopen(fd, "w") as f:
+            json.dump(items, f)
+        os.replace(tmp, KDE_TAKEN)
+    except OSError as e:
+        log(f"couldn't remember Spectacle's keys: {e}")
+
+
+def kde_restore_spectacle():
+    """Give Spectacle back the keys snypshot took from it (and Print Screen for
+    "Launch Spectacle"), once nothing else uses them. You changing a Spectacle key
+    yourself wins. Returns True if Print Screen is Spectacle's now."""
+    path = "/component/" + SPECTACLE.replace(".", "_")
+    try:
+        infos = kga("allShortcutInfos", reply="(a(ssssssaiai))", path=path,
+                    iface="org.kde.kglobalaccel.Component")[0]
+    except RuntimeError:
+        return False                               # Spectacle isn't installed
+    try:
+        ours = first_qt(kga("shortcutKeys", "(as)", (KDE_ACTION,), "(a(ai))")[0])
+    except RuntimeError:
+        ours = 0
+    taken = kde_taken_load()
+    todo = taken + [["_launch", QT_KEYS["Print"]]]
+    info = {i[0]: i for i in infos}
+    keep = []
+    for action, key in todo:
+        if action not in info:
+            continue
+        uname, fname, comp, cfname, ctx, cxf, keys, dflt = info[action]
+        if any(keys) or (action == "_launch" and key not in dflt):
+            continue                               # it has a key again (or never had it)
+        if key == ours or kde_owners(key):
+            if [action, key] in taken and [action, key] not in keep:
+                keep.append([action, key])         # still in use: try again next time
+            continue
+        kga("setForeignShortcutKeys", "(asa(ai))",
+            ([comp, uname, cfname, fname], [([key, 0, 0, 0],)]))
+    if keep != taken:
+        kde_taken_save(keep)
+    owners = kde_owners(QT_KEYS["Print"])
+    return any(aid[0] == SPECTACLE for aid, _ in owners)
+
+
+def kde_unbind(forget=True):
+    try:
+        try:
+            os.remove(KDE_HANDED)
+        except OSError:
+            pass
+        if forget:                                 # so it isn't set up again at next start
+            update_config(hotkey="")
+        kga("unregister", "(ss)", (KDE_ACTION[0], KDE_ACTION[1]), "(b)")
+        kga("unregister", "(ss)", tuple(KDE_OLD_ACTION), "(b)")
+        if kde_restore_spectacle():
+            print("Print Screen is back to Spectacle.")
+        else:
+            print("Removed snypshot's shortcut.")
+    except RuntimeError as e:
+        print(f"Couldn't remove the KDE shortcut ({e}); remove it in System Settings > "
+              "Shortcuts.")
+
+
+KDE_HANDED = os.path.join(os.path.dirname(CONFIG), "kde-handed-back")
+
+
+def kde_hand_back():
+    """You quit snypshot: its key would do nothing now (on KDE only a running snypshot
+    hears it), so give it back to Spectacle until snypshot starts again."""
+    try:
+        got = first_qt(kga("shortcutKeys", "(as)", (KDE_ACTION,), "(a(ai))")[0])
+        if not got:
+            return
+        os.makedirs(os.path.dirname(KDE_HANDED), exist_ok=True)
+        with open(KDE_HANDED, "w") as f:
+            f.write("1\n")
+        kga("setShortcutKeys", "(asa(ai)u)", (KDE_ACTION, [([0, 0, 0, 0],)], 2 | 4), "(a(ai))")
+        kde_restore_spectacle()
+        log("KDE: gave the screenshot key back to Spectacle while snypshot is off")
+    except (OSError, RuntimeError) as e:
+        log(f"KDE: couldn't hand the key back: {e}")
+
+
+def kde_take_back():
+    """snypshot is starting again after you quit it: take its key back from Spectacle
+    (only from Spectacle; if something else has it now, that stays)."""
+    if not os.path.exists(KDE_HANDED):
+        return
+    try:
+        os.remove(KDE_HANDED)
+    except OSError:
+        pass
+    saved = load_config()["hotkey"] or ""
+    try:
+        other = kde_apply_hotkey(saved) if saved else None
+        if other:
+            log(f"KDE: {saved} is used by '{other}' now; not taking it back")
+    except (ValueError, RuntimeError) as e:
+        log(f"KDE: couldn't take the key back: {e}")
+
+
+def refresh_kde_menus():
+    """KWin reads app permissions from KDE's app database; make sure it's current. Once
+    with our environment, and once with the session's (what KWin itself started with:
+    the database is kept per set of folders, and a terminal's list can differ)."""
+    tool = next((t for t in ("kbuildsycoca5", "kbuildsycoca6") if have(t)), None)
+    if not tool:
+        return
+    cmds = [[T(tool)]]
+    if have("systemd-run"):
+        cmds.append([T("systemd-run"), "--user", "--wait", "--quiet", "--collect", T(tool)])
+    for cmd in cmds:
+        try:
+            subprocess.run(cmd, env=clean_env(), capture_output=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log(f"{tool} didn't finish: {e}")
+
+
+def kde_py_current():
+    """True if snypshot's Python copy is installed by root and still the same program as
+    /usr/bin/python3 (after a Python update the old copy may no longer work)."""
+    if not (os.path.isfile(KDE_PY) and root_owned(KDE_PY)):
+        return False
+    real = os.path.realpath("/usr/bin/python3")
+    try:
+        if os.path.getsize(real) != os.path.getsize(KDE_PY):
+            return False
+        with open(real, "rb") as a, open(KDE_PY, "rb") as b:
+            while True:
+                x, y = a.read(1 << 20), b.read(1 << 20)
+                if x != y:
+                    return False
+                if not x:
+                    return True
+    except OSError:
+        return False
+
+
+def kde_status():
+    parts = []
+    if kde_py_current():
+        parts.append("fast KWin screenshots set up")
+    elif os.path.isfile(KDE_PY):
+        parts.append("Python was updated: run setup again to refresh snypshot's copy "
+                     "(using Spectacle until then)")
+    else:
+        parts.append("using Spectacle (run setup for faster, sharper screenshots)")
+    try:
+        acc = qt_to_accel(first_qt(kga("shortcutKeys", "(as)", (KDE_ACTION,), "(a(ai))")[0]))
+        parts.append(f"shortcut: {accel_label_plain(acc) if acc else 'none'}"
+                     + ("" if send("ping") == "ok" else " (snypshot isn't running, so it "
+                        "does nothing right now)"))
+    except RuntimeError as e:
+        parts.append(f"shortcut service: {str(e)[:80]}")
+    return "; ".join(parts)
+
+
+def accel_label_plain(accel):
+    """"<Shift>Print" -> "Shift+Print Screen" without needing GTK."""
+    mods = re.findall(r"<(\w+)>", accel)
+    name = re.sub(r"<\w+>", "", accel)
+    name = {"Print": "Print Screen"}.get(name, name if len(name) > 1 else name.upper())
+    return "+".join([m.replace("Control", "Ctrl") for m in mods] + [name])
+
+
+class KdeShortcut:
+    """Listens for the screenshot shortcut through KDE's shortcut service. You can also
+    change it in System Settings > Shortcuts, where it shows up as "snypshot"."""
+
+    def __init__(self, daemon):
+        from gi.repository import Gio
+        self.daemon = daemon
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.sub = bus.signal_subscribe(
+            "org.kde.kglobalaccel", "org.kde.kglobalaccel.Component", "globalShortcutPressed",
+            "/component/" + KDE_ACTION[0].replace(".", "_"), None, 0, self._pressed)
+        # Register now, and again if KDE's shortcut service ever restarts.
+        self.watch = Gio.bus_watch_name_on_connection(
+            bus, "org.kde.kglobalaccel", Gio.BusNameWatcherFlags.NONE,
+            lambda *_: self.register(), None)
+
+    def register(self):
+        try:
+            kga("blockGlobalShortcuts", "(b)", (False,))   # in case we died mid-recording
+            kde_take_back()                                # after you quit it
+            try:
+                kga("unregister", "(ss)", tuple(KDE_OLD_ACTION), "(b)")
+            except RuntimeError:
+                pass
+            kga("doRegister", "(as)", (KDE_ACTION,))
+            saved = load_config()["hotkey"] or ""
+            try:
+                want = accel_to_qt(saved)
+            except ValueError:
+                want = 0                                  # a key KDE can't name: skip it
+            # SetPresent, and let KDE load what you set in System Settings if anything
+            kga("setShortcutKeys", "(asa(ai)u)", (KDE_ACTION, [([want, 0, 0, 0],)], 2),
+                "(a(ai))")
+            got = first_qt(kga("shortcutKeys", "(as)", (KDE_ACTION,), "(a(ai))")[0])
+            if want and not got and not kde_owners(want):   # lost it somehow: put it back
+                got = first_qt(kga("setShortcutKeys", "(asa(ai)u)",
+                                   (KDE_ACTION, [([want, 0, 0, 0],)], 2 | 4), "(a(ai))")[0])
+            acc = qt_to_accel(got) if got else ""
+            if acc and acc != saved:
+                update_config(hotkey=acc)                  # changed in System Settings
+            elif want and not acc:                         # another app has the key: keep
+                log(f"KDE: {saved} is in use by another shortcut")   # your choice
+            log(f"KDE shortcut: {acc or 'none'}")
+        except Exception as e:
+            log(f"KDE shortcut service not available: {e}")
+
+    def _pressed(self, conn, sender, path, iface, signal, params):
+        comp, action = params.unpack()[:2]
+        if comp == KDE_ACTION[0] and action == KDE_ACTION[1]:
+            GLib.idle_add(lambda: self.daemon.capture() or False)
+
+
 # ---------------------------------------------------------------- background mode
 
-CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+CACHE_DIR = os.path.join(xdg("XDG_CACHE_HOME", "~/.cache"),
                          "snypshot")
 LOG = os.path.join(CACHE_DIR, "snypshot.log")
 SCRIPT = os.path.realpath(__file__)   # the real file, even when run as the `shot` alias
@@ -3422,7 +5198,7 @@ def run_tray(icon):
     first = item("Take screenshot", "capture-menu")
     item("Preferences", "prefs")
     menu.append(Gtk.SeparatorMenuItem())
-    item("Quit snypshot", "quit")
+    item("Quit snypshot", "quit-user")
     menu.show_all()
     ind.set_menu(menu)
     ind.set_secondary_activate_target(first)     # middle-click = screenshot
@@ -3455,6 +5231,7 @@ class Daemon:
                 parent = parent[:-len(" (deleted)")]
             if parent != "/usr/bin/gnome-shell" or not root_owned(parent):
                 sys.exit("snypshot: --helper is only for the GNOME helper extension")
+            no_dumps()                            # before the screenshot pipe opens
             HELPER = HelperChannel()
         no_dumps()
         init_gtk()
@@ -3462,13 +5239,26 @@ class Daemon:
         self.shot = None
         self.busy = False
 
-        private_dir()                             # our own 0700 folder, verified
-        if helper and send("ping") == "ok":       # an older, non-helper copy is running:
-            send("quit")                          # take over from it
-            for _ in range(40):
-                if send("ping") != "ok":
-                    break
+        # Only one background copy at a time: it holds this lock for as long as it runs
+        # (the kernel lets go of it if the copy dies, however it dies).
+        import fcntl
+        self.lock = os.open(os.path.join(private_dir(), "daemon.lock"),
+                            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        locked = False
+        for i in range(100 if helper else 1):
+            try:
+                fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except BlockingIOError:
+                if helper and i == 0:             # an older, non-helper copy is running:
+                    send("quit")                  # take over from it
                 time.sleep(0.05)
+        if not locked:
+            if capture_now:
+                send("capture")
+            log("another copy is already running; this one stops")
+            sys.exit(0)
         try:
             os.remove(SOCK)                       # stale socket from a crash
         except OSError:
@@ -3479,6 +5269,14 @@ class Daemon:
             self.srv.bind(SOCK)
         finally:
             os.umask(old_umask)
+        st = os.lstat(SOCK)
+        self.sock_id = (st.st_dev, st.st_ino)     # (quit only removes this socket)
+        for name in os.listdir(private_dir()):    # leftovers from a crash
+            if name.startswith(("grab-", "print-")):
+                try:
+                    os.remove(os.path.join(private_dir(), name))
+                except OSError:
+                    pass
         self.srv.listen(8)
         self.srv.setblocking(False)
         GLib.io_add_watch(self.srv.fileno(), GLib.PRIORITY_DEFAULT, GLib.IO_IN,
@@ -3489,6 +5287,12 @@ class Daemon:
         resume_hotkeys()                          # in case we died while you picked a key
         if load_config()["tray"]:
             self.set_tray(True)
+        self.kde_keys = None
+        if is_kde():                              # KDE: the shortcut comes to us directly
+            try:
+                self.kde_keys = KdeShortcut(self)
+            except Exception as e:
+                log(f"KDE shortcut service not available: {e}")
 
         for sig in (signal.SIGTERM, signal.SIGINT):
             GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, self.quit)
@@ -3549,9 +5353,16 @@ class Daemon:
 
     def on_request(self, *_):
         try:
+            self._request()
+        except Exception as e:                    # never stop listening, whatever happens
+            log(f"request failed: {e}")
+        return True
+
+    def _request(self):
+        try:
             conn, _ = self.srv.accept()
         except OSError:
-            return True
+            return
         cmd = ""
         try:
             # Only processes running as you may talk to snypshot (belt and braces: the
@@ -3561,14 +5372,17 @@ class Daemon:
                                     struct.calcsize("3i"))
             _pid, uid, _gid = struct.unpack("3i", creds)
             if uid != os.getuid():
-                return True
+                return
             conn.settimeout(0.5)
             cmd = conn.recv(64).decode(errors="replace").strip()
             if cmd == "test":                     # diagnostics: report, never save
-                conn.settimeout(70)
-                conn.sendall(self.test_capture().encode())
+                if self.busy or self.shot is not None:
+                    conn.sendall(b"busy: a screenshot is open right now")
+                else:
+                    conn.settimeout(70)
+                    conn.sendall(self.test_capture().encode())
             elif cmd == "version":
-                conn.sendall(VERSION.encode())
+                conn.sendall(BUILD.encode())
             else:
                 conn.sendall(b"ok")
         except OSError:
@@ -3583,9 +5397,19 @@ class Daemon:
             GLib.idle_add(lambda: self.open_prefs() or False)
         elif cmd == "quit":
             GLib.idle_add(lambda: self.quit() or False)
-        return True
+        elif cmd == "quit-user":                  # you quit it (tray or --quit)
+            GLib.idle_add(lambda: self.quit(hand_back=True) or False)
 
     def capture(self):
+        if self.shot is not None and self.shot.closed:
+            self.shot = None                      # closed but never told us (it crashed)
+        if self.shot is not None and self.shot.dialog_win is not None:
+            dlg = self.shot.dialog_window()       # a save/print dialog is open: go back to it
+            if dlg is not None:
+                dlg.present()
+                return
+            self.shot.close()                     # one that never showed up: start fresh
+            self.shot = None
         if self.shot is not None and getattr(self.shot, "hidden", False):
             self.shot.close()                     # a leftover hidden overlay: start fresh
         if self.shot is not None:                 # already open: just bring it forward
@@ -3620,21 +5444,28 @@ class Daemon:
             return f"FAILED: {str(e).splitlines()[-1]}"
         shots = img if isinstance(img, list) else [(None, img)]
         size = " + ".join(f"{im.width}x{im.height}" for _, im in shots)
+        gnome = "gnome" in os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+        kwin = ("" if _working_method == "kwin" or not is_kde() else
+                f" | KWin said: {_kwin_error} | running on {sys.executable}")
         return (f"OK: {size} via '{_working_method}' in "
-                f"{time.time() - t0:.2f}s" + ("" if _working_method == "ext" else
-                                              f" | helper: {helper_status()}")
+                f"{time.time() - t0:.2f}s" + ("" if _working_method == "ext" or not gnome else
+                                              f" | helper: {helper_status()}") + kwin
                 + (" | the GNOME part loaded right now is the OLD one (blurry on mixed "
                    "scaling): log out and back in to finish updating" if _old_helper else ""))
 
-    def quit(self, *_):
+    def quit(self, *_, hand_back=False):
         log("quit")
         if self.prefs is not None:
             self.prefs.stop_recording(cancel=True)   # give the screenshot keys back
+        if hand_back and is_kde():
+            kde_hand_back()                       # so Print Screen still does something
         if self.tray and self.tray.poll() is None:
             self.tray.terminate()
         try:
             self.srv.close()
-            os.remove(SOCK)
+            st = os.lstat(SOCK)
+            if (st.st_dev, st.st_ino) == self.sock_id:   # (not a newer copy's socket)
+                os.remove(SOCK)
         except OSError:
             pass
         self.loop.quit()
@@ -3645,7 +5476,7 @@ DESKTOP_ENTRY = """[Desktop Entry]
 Type=Application
 Name=snypshot
 Comment=Lightshot-style screenshots
-Exec="{exe}" {arg}
+Exec={cmd}
 Icon={icon}
 Terminal=false
 Categories=Utility;Graphics;
@@ -3653,12 +5484,22 @@ X-GNOME-Autostart-enabled=true
 """
 
 
+def daemon_python():
+    """The Python the background copy runs on: on KDE, snypshot's own copy (the one KWin
+    trusts for screenshots) if setup installed it; otherwise the system Python."""
+    if is_kde() and kde_py_current() and subprocess.run(
+            [KDE_PY, "-I", "-c", "import gi, PIL, cairo"], capture_output=True,
+            env=clean_env()).returncode == 0:
+        return KDE_PY
+    return sys.executable
+
+
 def install(gnome_helper=False):
     if any(ch in SCRIPT for ch in '"\\\n$`%'):
         print("Refusing: odd characters in the install path.")
         return
-    home_cfg = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
-    home_data = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
+    home_cfg = xdg("XDG_CONFIG_HOME", "~/.config")
+    home_data = xdg("XDG_DATA_HOME", "~/.local/share")
     folders = {os.path.join(home_data, "applications"): "--preferences"}  # app menu: settings
     autostart = os.path.join(home_cfg, "autostart", "snypshot.desktop")
     if gnome_helper:                  # the GNOME helper starts snypshot itself at login
@@ -3671,14 +5512,14 @@ def install(gnome_helper=False):
     for folder, arg in folders.items():
         os.makedirs(folder, exist_ok=True)
         with open(os.path.join(folder, "snypshot.desktop"), "w") as f:
-            f.write(DESKTOP_ENTRY.format(exe=SCRIPT, icon=tray_icon_path(), arg=arg))
+            f.write(DESKTOP_ENTRY.format(cmd=f'"{SCRIPT}" {arg}', icon=tray_icon_path()))
     print("snypshot is in your app menu" + ("." if gnome_helper else
                                         " and will start in the background at login."))
 
 
 def uninstall():
-    home_cfg = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
-    home_data = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
+    home_cfg = xdg("XDG_CONFIG_HOME", "~/.config")
+    home_data = xdg("XDG_DATA_HOME", "~/.local/share")
     for folder in (os.path.join(home_cfg, "autostart"), os.path.join(home_data, "applications")):
         try:
             os.remove(os.path.join(folder, "snypshot.desktop"))
@@ -3696,8 +5537,8 @@ def migrate_from_shot():
     """Move an existing `shot` install over to snypshot: settings, Print Screen key,
     app-menu entry and the old helper. Only touches things that are recognisably ours
     (another app could also be called "shot"). Returns True if there was one."""
-    home_cfg = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
-    home_data = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
+    home_cfg = xdg("XDG_CONFIG_HOME", "~/.config")
+    home_data = xdg("XDG_DATA_HOME", "~/.local/share")
     found = False
 
     def remove_if_ours(path, marker):
@@ -3721,7 +5562,10 @@ def migrate_from_shot():
         found |= remove_if_ours(f, b"Lightshot-style")
     if have("gsettings"):
         old_key = KEY_PATH.replace("/snypshot/", f"/{OLD_NAME}/")
-        paths = custom_key_paths()
+        try:
+            paths = custom_key_paths()
+        except RuntimeError:
+            paths = []                            # unreadable: leave them all alone
         cmd = gset("get", f"{MEDIA_KEYS}.custom-keybinding:{old_key}", "command")
         if old_key in paths and cmd.strip("'") == ALIAS:
             found = True
@@ -3730,10 +5574,16 @@ def migrate_from_shot():
     old_dir = os.path.join(home_cfg, OLD_NAME)
     old_cfg = os.path.join(old_dir, "config.json")
     if found and os.path.isfile(old_cfg) and not os.path.islink(old_cfg):
-        if not os.path.exists(CONFIG):            # colors, brush size, last folder
+        if not os.path.lexists(CONFIG):           # colors, brush size, last folder
             os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
-            shutil.copyfile(old_cfg, CONFIG)
-            os.chmod(CONFIG, 0o600)
+            with open(old_cfg, "rb") as f:
+                data = f.read(1 << 20)
+            try:
+                fd = os.open(CONFIG, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(data)
+            except OSError:
+                pass
         os.remove(old_cfg)
         try:
             os.rmdir(old_dir)
@@ -3781,9 +5631,14 @@ def custom_key_paths():
     import ast
     raw = gset("get", MEDIA_KEYS, "custom-keybindings").replace("@as ", "")
     try:
-        return list(ast.literal_eval(raw))
+        v = ast.literal_eval(raw)
+        if isinstance(v, list) and all(isinstance(x, str) for x in v):
+            return v
     except Exception:
-        return []
+        pass
+    # Couldn't read them: better to change nothing than to write back an empty list
+    # and wipe your other custom shortcuts.
+    raise RuntimeError("couldn't read your custom shortcuts from gsettings")
 
 
 SHELL_KEYS = "org.gnome.shell.keybindings"
@@ -3802,9 +5657,11 @@ def gsettings_list(schema, key):
     raw = gset("get", schema, key).replace("@as ", "")
     try:
         v = ast.literal_eval(raw)
-        return [x for x in v if isinstance(x, str)]
+        if isinstance(v, list):
+            return [x for x in v if isinstance(x, str)]
     except Exception:
-        return []
+        pass
+    raise RuntimeError(f"couldn't read {schema} {key}")
 
 
 def hotkey_owner(accel):
@@ -3822,9 +5679,15 @@ def apply_hotkey(accel, take=False):
     """Make accel ("Print", "<Shift>Print", "<Super><Shift>s"...) take a screenshot.
     "" turns the shortcut off. If another custom shortcut has it, returns that one's
     name and changes nothing, unless take=True (then it loses the key, keeps the rest).
-    GNOME's own screenshot keys always give it up."""
+    GNOME's own screenshot keys always give it up. Raises ValueError / RuntimeError
+    (with a message for you) if it can't be done safely."""
     if accel and not ACCEL_RE.fullmatch(accel):
-        return "that key"
+        raise ValueError("That key can't be used as a shortcut.")
+    if is_kde():
+        return kde_apply_hotkey(accel, take)
+    if not re.fullmatch(r"/[A-Za-z0-9_./+-]+", SCRIPT):
+        # GNOME splits the command like a shell would; keep it to plain path characters
+        raise ValueError(f"Install snypshot to {BIN} first (python3 snypshot.py --setup).")
     other = hotkey_owner(accel)
     if other and not take:
         return other
@@ -3853,18 +5716,48 @@ def apply_hotkey(accel, take=False):
     return None
 
 
-SUSPENDED = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+SUSPENDED = os.path.join(xdg("XDG_CACHE_HOME", "~/.cache"),
                          "snypshot", "suspended-keys.json")
+
+
+KDE_UNBLOCKER = None
+KDE_UNBLOCK_CODE = """
+import sys
+from gi.repository import Gio, GLib
+sys.stdin.buffer.read()                      # returns when snypshot closes it or dies
+Gio.bus_get_sync(Gio.BusType.SESSION, None).call_sync(
+    "org.kde.kglobalaccel", "/kglobalaccel", "org.kde.KGlobalAccel", "blockGlobalShortcuts",
+    GLib.Variant("(b)", (False,)), None, Gio.DBusCallFlags.NONE, 3000, None)
+"""
 
 
 def suspend_hotkeys():
     """While you pick a new shortcut, switch off the screenshot keys (ours and GNOME's)
     so pressing one reaches the Preferences window instead of taking a screenshot.
     Remembered on disk, so they come back even if snypshot is killed meanwhile."""
+    if is_kde():
+        # KDE can only switch off ALL global shortcuts, and doesn't switch them back on
+        # if we die. So a tiny watcher does that as soon as our end of its pipe closes:
+        # when you're done picking, or if snypshot crashes or is killed.
+        global KDE_UNBLOCKER
+        if KDE_UNBLOCKER is None:
+            try:
+                KDE_UNBLOCKER = subprocess.Popen(
+                    [sys.executable, "-I", "-c", KDE_UNBLOCK_CODE], stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True, env=clean_env())
+                kga("blockGlobalShortcuts", "(b)", (True,))
+            except (OSError, RuntimeError):
+                pass
+        return
     if not have("gsettings") or os.path.exists(SUSPENDED):
         return
-    saved = {"ours": gset("get", f"{MEDIA_KEYS}.custom-keybinding:{KEY_PATH}", "binding").strip("'"),
-             "shell": {k: gsettings_list(SHELL_KEYS, k) for k in SHELL_SHOT_KEYS}}
+    try:
+        saved = {"ours": gset("get", f"{MEDIA_KEYS}.custom-keybinding:{KEY_PATH}",
+                              "binding").strip("'"),
+                 "shell": {k: gsettings_list(SHELL_KEYS, k) for k in SHELL_SHOT_KEYS}}
+    except RuntimeError:
+        return                                    # can't remember them: don't touch them
     cache_dir()
     fd = os.open(SUSPENDED, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w") as f:
@@ -3875,6 +5768,20 @@ def suspend_hotkeys():
 
 
 def resume_hotkeys():
+    if is_kde():
+        global KDE_UNBLOCKER
+        try:
+            kga("blockGlobalShortcuts", "(b)", (False,))
+        except RuntimeError:
+            pass
+        if KDE_UNBLOCKER is not None:
+            KDE_UNBLOCKER.stdin.close()           # (it unblocks too, harmlessly)
+            try:
+                KDE_UNBLOCKER.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                KDE_UNBLOCKER.kill()
+            KDE_UNBLOCKER = None
+        return
     try:
         with open(SUSPENDED) as f:
             saved = json.load(f)
@@ -3896,32 +5803,51 @@ def bind_key(key=None):
     """Point the screenshot key (Print Screen unless you changed it) at snypshot in
     GNOME, keeping your other custom shortcuts."""
     key = load_config()["hotkey"] if key is None else key
-    if not have("gsettings") or "gnome" not in os.environ.get("XDG_CURRENT_DESKTOP", "").lower():
+    if is_kde():
+        pass                                      # KDE's shortcut service: see apply_hotkey
+    elif not have("gsettings") or "gnome" not in os.environ.get("XDG_CURRENT_DESKTOP", "").lower():
         print("Automatic key setup only works on GNOME. Add a custom shortcut in your "
               f"keyboard settings that runs:  {SCRIPT}")
-        return
-    other = apply_hotkey(key)
+        return False
+    try:
+        other = apply_hotkey(key)
+    except (ValueError, RuntimeError) as e:
+        print(f"Couldn't set the screenshot key: {e}")
+        return False
     if other:
         answer = ""
         if sys.stdin.isatty():
             answer = input(f"Your '{other}' shortcut is using {key}. Give {key} to snypshot "
                            f"instead? ('{other}' is kept, just without a key) [Y/n] ")
         if sys.stdin.isatty() and answer.strip().lower() in ("", "y", "yes"):
-            apply_hotkey(key, take=True)
+            try:
+                apply_hotkey(key, take=True)
+            except (ValueError, RuntimeError) as e:
+                print(f"Couldn't set the screenshot key: {e}")
+                return False
             print(f"Took {key} off '{other}'.")
         else:
-            print(f"Your custom shortcut '{other}' already uses {key}. Change it in "
-                  "Settings > Keyboard > Custom Shortcuts, or pick another key in snypshot's "
-                  "Preferences.")
-            return
-    print(f"{key} now opens snypshot. (Your other custom shortcuts are untouched.)")
+            where = ("System Settings > Shortcuts" if is_kde()
+                     else "Settings > Keyboard > Custom Shortcuts")
+            print(f"Your shortcut '{other}' already uses {key}. Change it in {where}, "
+                  "or pick another key in snypshot's Preferences.")
+            return False
+    print(f"{accel_label_plain(key) if key else 'No key'} now opens snypshot.")
+    return True
 
 
 def unbind_key():
-    paths = [p for p in custom_key_paths() if p != KEY_PATH]
-    gset("set", MEDIA_KEYS, "custom-keybindings", str(paths))
+    if is_kde():
+        return kde_unbind()
+    if not have("gsettings"):
+        return
+    resume_hotkeys()                              # first, so nothing is written back later
+    try:
+        paths = [p for p in custom_key_paths() if p != KEY_PATH]
+        gset("set", MEDIA_KEYS, "custom-keybindings", str(paths))
+    except RuntimeError as e:
+        print(f"Couldn't remove the shortcut ({e}); remove it in Settings > Keyboard.")
     gset("reset-recursively", f"{MEDIA_KEYS}.custom-keybinding:{KEY_PATH}")
-    resume_hotkeys()
     for k in SHELL_SHOT_KEYS:                     # GNOME's own screenshot keys, as they were
         gset("reset", SHELL_KEYS, k)
     print("Print Screen is back to GNOME's screenshot tool.")
@@ -3931,7 +5857,7 @@ def replace_old_daemon():
     """After an update, the background copy is still running the OLD code (Python loaded
     it at login). If it isn't this version, stop it; the GNOME helper (or the code
     below in main) starts the new one straight away."""
-    if send("ping") != "ok" or send("version") == VERSION:
+    if send("ping") != "ok" or send("version") == BUILD:
         return
     log(f"replacing an older running copy with {VERSION}")
     send("quit")
@@ -3948,6 +5874,13 @@ def replace_old_daemon():
             if send("ping") == "ok":
                 return
             time.sleep(0.1)
+    elif is_kde():                                # KDE's key only talks to a running copy,
+        subprocess.Popen([sys.executable, "-I", SCRIPT, "--daemon"], env=clean_env(),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)   # so start one
+        for _ in range(100):
+            if send("ping") == "ok":
+                return
+            time.sleep(0.1)
 
 
 def main():
@@ -3961,15 +5894,23 @@ def main():
     if "--test-capture" in args or "--doctor" in args:
         # Diagnostics. The background copy does the capture and only REPORTS how it
         # went; no screenshot is ever written to disk (or it could be abused).
-        print(f"installed at:   {SCRIPT} ({'root-owned, good' if root_owned(SCRIPT) else 'NOT root-owned: the GNOME helper will refuse it'})")
+        print(f"installed at:   {SCRIPT}" + ("" if root_owned(SCRIPT) else
+                                                 " (NOT root-owned: the GNOME helper will refuse it)"))
         print(f"version:        {VERSION}")
         replace_old_daemon()
         running = send("version") if send("ping") == "ok" else None
+        if running and running != BUILD:
+            running = running.split()[0] + (" (an older copy; run snypshot --quit, then "
+                                             "snypshot --daemon)" if is_kde() else
+                                             " (an older copy; press Print Screen to update it)")
+        elif running:
+            running = running.split()[0]
         print(f"background:     {('running ' + running) if running else 'not running (start: snypshot --daemon)'}")
         if "gnome" in os.environ.get("XDG_CURRENT_DESKTOP", "").lower():
             print(f"GNOME helper:   {helper_status()}")
             print(f"portal opt-in:  {'yes (less private)' if load_config().get('allow_portal') else 'no'}")
-        print("clipboard:      built in (GTK)")
+        if is_kde():
+            print(f"KDE:            {kde_status()}")
         if send("ping") == "ok":
             print(f"test capture:   {send('test', timeout=75) or 'no answer'}")
         return
@@ -3989,16 +5930,31 @@ def main():
         run_tray(args[args.index("--tray") + 1])
         return
     if "--quit" in args:
-        print("stopped snypshot" if send("quit") == "ok" else "snypshot wasn't running")
+        if send("quit-user") != "ok":
+            print("snypshot wasn't running")
+            return
+        handed = True
+        for _ in range(20):
+            if send("ping") != "ok":
+                break
+            time.sleep(0.05)
+        else:
+            send("quit")                          # an older copy that doesn't know quit-user
+            handed = False
+        print("stopped snypshot" + (" (Print Screen goes to Spectacle until it starts again)"
+                                    if is_kde() and handed else ""))
         return
     if "--install-extension" in args:
         install_extension()
         return
     if "--install" in args:
         moved = migrate_from_shot()
-        bind_key()
-        helper = install_extension()
-        install(gnome_helper=helper)
+        if is_kde():                              # KDE's shortcut runs the app-menu entry,
+            install()                             # so that has to exist first
+            bound = bind_key()
+        else:
+            bound = bind_key()
+            install(gnome_helper=install_extension())
         replace_old_daemon()
         if moved:                                 # the old helper restarts us through the
             for _ in range(80):                   # `shot` alias; wait for that
@@ -4006,12 +5962,44 @@ def main():
                     break
                 time.sleep(0.1)
             clean_old_cache()
-        if send("ping") != "ok":
-            subprocess.Popen([sys.executable, "-I", SCRIPT, "--daemon"], env=clean_env(),
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if is_kde():
+            refresh_kde_menus()                   # so KWin sees the screenshot permission
+        def start_bg():
+            if send("ping") != "ok":
+                subprocess.Popen([sys.executable, "-I", SCRIPT, "--daemon"], env=clean_env(),
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(100):
+                if send("ping") == "ok":
+                    break
+                time.sleep(0.1)
+        start_bg()
+        fast = False
+        if is_kde() and kde_py_current():
+            # Right after setup KWin can take a moment to see the new permission. Check,
+            # and give it a couple of tries (with a fresh background copy) before saying so.
+            for attempt in range(3):
+                fast = "via 'kwin'" in (send("test", timeout=30) or "")
+                if fast or attempt == 2:
+                    break
+                time.sleep(2)
+                send("quit")
+                for _ in range(50):
+                    if send("ping") != "ok":
+                        break
+                    time.sleep(0.1)
+                start_bg()
         if "--from-setup" in args:
             print()
-            if helper_active():
+            if is_kde():
+                key = accel_label_plain(load_config()["hotkey"] or "")
+                print(f"Done! Press {key}." if bound and key else
+                      "Done! Pick a screenshot key in snypshot's Preferences (in your app "
+                      "menu) or in System Settings > Shortcuts.")
+                if kde_py_current() and not fast:
+                    print("KDE hasn't picked up snypshot's screenshot permission yet, so it "
+                          "uses Spectacle for now (slower).\nLog out and back in once "
+                          "whenever you like to make it instant.")
+            elif helper_active():
                 print("Done! Press Print Screen.")
             elif moved and send("ping") == "ok":
                 print("Done! Print Screen works now (your settings came along from shot).\n"
@@ -4025,10 +6013,18 @@ def main():
         if "gnome" in os.environ.get("XDG_CURRENT_DESKTOP", "").lower():
             unbind_key()
             uninstall_extension()
+        if is_kde():
+            kde_unbind(forget=False)
         files = [f for f in (BIN, ALIAS) if os.path.exists(f) and _ours(f)]
+        files += [f for f in (KDE_PY, OLD_KDE_PY) if os.path.exists(f) and _ours_py(f)]
+        files += [f for f in (KWIN_DESKTOP, OLD_KWIN_DESKTOP) if os.path.exists(f) and _ours(f)]
         if files and os.geteuid() != 0:
             print("Removing the program itself (asks for your password):")
-            subprocess.run([T("sudo"), "rm", "-f", *files], env=clean_env())
+            subprocess.run([T("sudo"), "/usr/bin/rm", "-f", "--", *files], env=clean_env())
+            for d in (os.path.dirname(KDE_PY), os.path.dirname(OLD_KDE_PY)):
+                if os.path.isdir(d):
+                    subprocess.run([T("sudo"), "/usr/bin/rmdir", "--", d], env=clean_env(),
+                                   capture_output=True)
         print("snypshot is gone. Your settings are in ~/.config/snypshot if you want them.")
         return
     if "--once" in args:
@@ -4041,6 +6037,7 @@ def main():
         return
 
     if "--preferences" in args:
+        replace_old_daemon()                      # just updated? open the new version's
         if send("ping") != "ok":                  # start the background copy first
             subprocess.run([sys.executable, "-I", SCRIPT, "--daemon"], env=clean_env(),
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -4081,7 +6078,7 @@ def main():
 
     if "--foreground" not in args:                # detach, so the terminal/shortcut returns
         out = os.fdopen(log_fd(), "a")
-        cmd = [sys.executable, "-I", SCRIPT, "--daemon", "--foreground"]
+        cmd = [daemon_python(), "-I", SCRIPT, "--daemon", "--foreground"]
         if capture_now:
             cmd.append("--capture")
         started = False
