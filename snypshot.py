@@ -45,7 +45,7 @@ def xdg(var, default):
 
 RUNTIME_DIR = xdg("XDG_RUNTIME_DIR", f"/tmp/snypshot-{os.getuid()}")
 SOCK = os.path.join(RUNTIME_DIR, "snypshot", "snypshot.sock")
-VERSION = "1.1"   # bump on every release
+VERSION = "1.1.1"   # bump on every release
 
 
 def build_id():
