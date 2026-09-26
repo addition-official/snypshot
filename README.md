@@ -71,6 +71,7 @@ KDE Plasma doesn't need that: KWin hands screenshots to apps it's told to trust,
 
 ## KDE Plasma notes
 
+- snypshot restarts itself if it ever crashes or KWin restarts, so Print Screen keeps working.
 - Print Screen goes to snypshot instead of Spectacle. If you quit snypshot (tray icon > Quit), Print Screen goes back to Spectacle until snypshot starts again. Uninstalling gives Spectacle its keys back.
 - On a screen with fractional scaling (like 125%), the frozen screen you draw on can look a little soft. The saved or copied image is still pixel-perfect.
 

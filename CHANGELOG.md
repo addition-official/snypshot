@@ -25,6 +25,7 @@
 - The screenshot shortcut can't be set to a plain key like Enter by accident, turning it off now sticks, and Reset restores GNOME's own screenshot keys.
 - A damaged settings file or an unreadable shortcut list can no longer crash snypshot or wipe your other custom shortcuts.
 - Only one background copy can run at a time, and it keeps listening even if a request fails.
+- On KDE, snypshot runs as a small user service and restarts itself within a few seconds if it ever crashes or loses the screen (for example when KWin restarts), so Print Screen never stays dead. Quitting it on purpose still stays quit.
 
 **Security**
 - Setup's root install step refuses any file that changed (or was swapped for a link) while sudo waited for your password; the checksum is fixed before sudo starts.
