@@ -5494,6 +5494,71 @@ def daemon_python():
     return sys.executable
 
 
+SERVICE = "snypshot.service"
+SERVICE_UNIT = """[Unit]
+Description=snypshot, Lightshot-style screenshots (the background part)
+PartOf=graphical-session.target
+After=graphical-session.target
+StartLimitIntervalSec=120
+StartLimitBurst=10
+
+[Service]
+ExecStart="{script}" --service
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
+"""
+
+
+def service_file():
+    return os.path.join(xdg("XDG_CONFIG_HOME", "~/.config"), "systemd", "user", SERVICE)
+
+
+def systemctl(*args, timeout=15):
+    """systemctl --user ...; True if it worked."""
+    if not have("systemctl"):
+        return False
+    try:
+        return subprocess.run([T("systemctl"), "--user", *args], env=clean_env(),
+                              capture_output=True, timeout=timeout).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def use_service():
+    """KDE: snypshot runs as a small user service, so it comes back by itself if it ever
+    crashes or loses the screen (e.g. KWin restarting). On KDE only a running snypshot
+    hears Print Screen, so that matters there. Quitting it on purpose stays quit."""
+    return is_kde() and os.path.isfile(service_file())
+
+
+def install_service():
+    """Set up the user service (KDE). False if this system can't (no systemd --user)."""
+    if not systemctl("show-environment"):
+        return False
+    path = service_file()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(SERVICE_UNIT.format(script=SCRIPT))
+    if systemctl("daemon-reload") and systemctl("enable", SERVICE):
+        return True
+    os.remove(path)
+    systemctl("daemon-reload")
+    return False
+
+
+def remove_service():
+    if os.path.exists(service_file()):
+        systemctl("disable", "--now", SERVICE)
+        try:
+            os.remove(service_file())
+        except OSError:
+            pass
+        systemctl("daemon-reload")
+
+
 def install(gnome_helper=False):
     if any(ch in SCRIPT for ch in '"\\\n$`%'):
         print("Refusing: odd characters in the install path.")
@@ -5502,7 +5567,8 @@ def install(gnome_helper=False):
     home_data = xdg("XDG_DATA_HOME", "~/.local/share")
     folders = {os.path.join(home_data, "applications"): "--preferences"}  # app menu: settings
     autostart = os.path.join(home_cfg, "autostart", "snypshot.desktop")
-    if gnome_helper:                  # the GNOME helper starts snypshot itself at login
+    service = is_kde() and install_service()
+    if gnome_helper or service:       # the GNOME helper / the service starts it at login
         try:
             os.remove(autostart)
         except OSError:
@@ -5515,6 +5581,7 @@ def install(gnome_helper=False):
             f.write(DESKTOP_ENTRY.format(cmd=f'"{SCRIPT}" {arg}', icon=tray_icon_path()))
     print("snypshot is in your app menu" + ("." if gnome_helper else
                                         " and will start in the background at login."))
+    return service
 
 
 def uninstall():
@@ -5525,6 +5592,7 @@ def uninstall():
             os.remove(os.path.join(folder, "snypshot.desktop"))
         except OSError:
             pass
+    remove_service()
     set_portal_permission(False)
     cfg = load_config()
     if cfg.get("allow_portal"):
@@ -5885,6 +5953,9 @@ def replace_old_daemon():
 
 def main():
     args = sys.argv[1:]
+    if "--service" in args:                       # started by the user service (KDE)
+        py = daemon_python()
+        os.execve(py, [py, "-I", SCRIPT, "--daemon", "--foreground"], clean_env())
     if "--bind-key" in args:
         bind_key()
         return
@@ -5949,8 +6020,13 @@ def main():
         return
     if "--install" in args:
         moved = migrate_from_shot()
-        if is_kde():                              # KDE's shortcut runs the app-menu entry,
-            install()                             # so that has to exist first
+        if is_kde():
+            if install() and send("ping") == "ok":   # now there's a service: hand over to it
+                send("quit")                      # (a copy it didn't start can't be
+                for _ in range(50):               # restarted by it)
+                    if send("ping") != "ok":
+                        break
+                    time.sleep(0.1)
             bound = bind_key()
         else:
             bound = bind_key()
@@ -6076,6 +6152,18 @@ def main():
             return
         log("the GNOME helper didn't start snypshot; running it directly")
 
+    if "--foreground" not in args and use_service():   # KDE: through the user service
+        if systemctl("start", SERVICE):
+            for _ in range(100):
+                if send("ping") == "ok":
+                    if capture_now:
+                        send("capture")
+                    else:
+                        print("snypshot is running in the background. Press your screenshot "
+                              "key to use it.")
+                    return
+                time.sleep(0.1)
+        log("the snypshot service didn't start; running it directly")
     if "--foreground" not in args:                # detach, so the terminal/shortcut returns
         out = os.fdopen(log_fd(), "a")
         cmd = [daemon_python(), "-I", SCRIPT, "--daemon", "--foreground"]
