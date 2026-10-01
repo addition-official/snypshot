@@ -9,15 +9,17 @@
 Download it, then run its setup:
 
 ```sh
-curl -fLO https://github.com/addition-official/snypshot/releases/latest/download/snypshot.py
+wget https://github.com/addition-official/snypshot/releases/latest/download/snypshot.py
 python3 snypshot.py --setup
 ```
+
+(No `wget`? `curl -fLO` with the same link works too.)
 
 Nothing gets piped into a shell. It's one readable Python file, so you can look through it before you run it. Setup asks for your password once, to install the program for all users.
 
 On **KDE Plasma**, that's it: press **Print Screen**. On **GNOME**, **log out and back in once** first.
 
-Works on **GNOME** and **KDE Plasma** on Wayland (tested on Ubuntu 24.04 and 26.04, with GNOME and with KDE Plasma 5.27 and 6.6). Other desktops may work but aren't tested yet.
+Works on **GNOME** and **KDE Plasma** on Wayland (tested on Ubuntu 24.04 and 26.04, with GNOME and with KDE Plasma 5.27 and 6.6). Other desktops may work but aren't tested yet. If you use both GNOME and KDE, run setup once in each.
 
 ## Updating
 
@@ -55,12 +57,13 @@ Right-click the tray icon and pick **Preferences**, or open snypshot from your a
 ## Commands
 
 ```
-snypshot              take a screenshot (Print Screen runs this; `shot` works too)
+snypshot                take a screenshot (Print Screen runs this; `shot` works too)
 snypshot --preferences  open Preferences
-snypshot --doctor     check the setup and do a test capture (nothing is saved)
-snypshot --version    show the version
-snypshot --quit       stop the background copy
-snypshot --uninstall  remove snypshot completely
+snypshot --doctor       check the setup and do a test capture (nothing is saved)
+snypshot --version      show the version
+snypshot --quit         stop the background copy
+snypshot --uninstall    remove snypshot completely
+snypshot --help         all of this
 ```
 
 ## Why log out once on GNOME?
@@ -79,7 +82,7 @@ KDE Plasma doesn't need that: KWin hands screenshots to apps it's told to trust,
 
 - Screenshots never touch the disk unless you save or print them (printing writes a temporary PDF in a private folder and deletes it right after). They go from GNOME Shell or KWin to snypshot over a private pipe.
 - On GNOME, the extension only hands screenshots to the copy of snypshot it started itself, and only if that copy is installed by root, so other programs can't swap themselves in. It refuses while snypshot is being debugged.
-- On KDE, KWin trusts snypshot's own copy of Python (installed by root) to take screenshots. Like Spectacle's permission, that means programs you run could use it to take a screenshot without asking, which KDE already allows through Spectacle anyway.
+- On KDE, KWin trusts snypshot's own copy of Python (installed by root) to take screenshots, for every user on this computer. Like Spectacle's permission, that means programs you run could use it to take a screenshot without asking, which KDE already allows through Spectacle anyway.
 - The overlay is a native Wayland window that other apps can't read.
 - snypshot doesn't use the network.
 

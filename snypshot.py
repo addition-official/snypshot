@@ -35,6 +35,10 @@ private pipe. The overlay is a native Wayland window other apps can't read. See 
 
 import os
 import sys
+# NOTHING may be imported above the isolation re-exec further down: `python3 snypshot.py`
+# puts this file's folder (e.g. Downloads) first on the import path, so an import here
+# could load a planted file. The functions below only use os and sys.
+
 
 def xdg(var, default):
     """An XDG folder from the environment, if it's set to an absolute path (the spec says
@@ -45,7 +49,7 @@ def xdg(var, default):
 
 RUNTIME_DIR = xdg("XDG_RUNTIME_DIR", f"/tmp/snypshot-{os.getuid()}")
 SOCK = os.path.join(RUNTIME_DIR, "snypshot", "snypshot.sock")
-VERSION = "1.1.1"   # bump on every release
+VERSION = "1.1.2"   # bump on every release
 
 
 def build_id():
@@ -57,9 +61,6 @@ def build_id():
             return f"{VERSION} {hashlib.sha256(f.read()).hexdigest()[:12]}"
     except OSError:
         return VERSION
-
-
-BUILD = build_id()                # what this running copy is
 
 
 def send(cmd, timeout=1.0):  # noqa: E302
@@ -76,9 +77,14 @@ def send(cmd, timeout=1.0):  # noqa: E302
             s.close()
             return None
         s.sendall(cmd.encode() + b"\n")
-        reply = s.recv(256).decode().strip()
+        reply = b""
+        while len(reply) < 4096:                  # (the reply ends when it hangs up)
+            chunk = s.recv(1024)
+            if not chunk:
+                break
+            reply += chunk
         s.close()
-        return reply or None
+        return reply.decode(errors="replace").strip() or None
     except OSError:
         return None
 
@@ -119,6 +125,8 @@ os.environ.pop("SNYPSHOT_REEXEC", None)
 
 # Only import from folders nobody but root can change.
 sys.path[:] = [p for p in sys.path if _root_only(p)]
+
+BUILD = build_id()                # what this running copy is (imports are safe from here)
 
 OLD_NAME = "shot"                 # what snypshot was called before; `shot` stays as an alias
 BIN = "/usr/local/bin/snypshot"
@@ -237,7 +245,15 @@ def setup():
 
     def run(cmd):
         print("  $ " + " ".join(cmd))
-        return subprocess.run(cmd).returncode == 0
+        try:
+            return subprocess.run(cmd).returncode == 0
+        except OSError as e:
+            print(f"  ({e})")
+            return False
+
+    if not os.path.exists("/usr/bin/sudo"):
+        sys.exit("Setup needs sudo (to install snypshot for all users). Install sudo, or ask "
+                 "whoever runs this computer to add you to the sudo group.")
 
     def sudo_install(data, dest, mode="755"):
         """Root copy of data at dest. Root reads it from a private temp copy, but only
@@ -275,29 +291,36 @@ def setup():
                            "import gi; gi.require_version('AyatanaAppIndicator3', '0.1')"],
                           capture_output=True).returncode == 0
     notify = os.path.exists("/usr/bin/notify-send")
-    if need or not tray or not notify:
-        pkgs = None
-        if os.path.exists("/usr/bin/apt-get"):
-            pkgs = (["/usr/bin/apt-get", "install", "-y"],
-                    ["python3-gi", "python3-gi-cairo", "gir1.2-gtk-4.0", "python3-pil",
-                     "gir1.2-ayatanaappindicator3-0.1", "libnotify-bin"])
-        elif os.path.exists("/usr/bin/dnf"):
-            pkgs = (["/usr/bin/dnf", "install", "-y"],
-                    ["python3-gobject", "gtk4", "python3-pillow",
-                     "libayatana-appindicator-gtk3", "libnotify"])
-        elif os.path.exists("/usr/bin/pacman"):
-            pkgs = (["/usr/bin/pacman", "-S", "--needed", "--noconfirm"],
-                    ["python-gobject", "python-cairo", "gtk4", "python-pillow",
-                     "libayatana-appindicator", "libnotify"])
+    pkgs = None                                # (what's needed, extras: tray icon, notifications)
+    if os.path.exists("/usr/bin/apt-get"):
+        pkgs = (["/usr/bin/apt-get", "install", "-y"],
+                ["python3-gi", "python3-gi-cairo", "gir1.2-gtk-4.0", "python3-pil"],
+                (["gir1.2-ayatanaappindicator3-0.1"] if not tray else [])
+                + (["libnotify-bin"] if not notify else []))
+    elif os.path.exists("/usr/bin/dnf"):
+        pkgs = (["/usr/bin/dnf", "install", "-y"],
+                ["python3-gobject", "python3-cairo", "gtk4", "python3-pillow"],
+                (["libayatana-appindicator-gtk3"] if not tray else [])
+                + (["libnotify"] if not notify else []))
+    elif os.path.exists("/usr/bin/pacman"):
+        pkgs = (["/usr/bin/pacman", "-S", "--needed", "--noconfirm"],
+                ["python-gobject", "python-cairo", "gtk4", "python-pillow"],
+                (["libayatana-appindicator"] if not tray else [])
+                + (["libnotify"] if not notify else []))
+    if need and pkgs is None:
+        sys.exit("1/3 Couldn't find apt, dnf or pacman. Install PyGObject with GTK 4, Pillow "
+                 "and pycairo, then run this again.")
+    if need:
         print("1/3 Installing what snypshot needs (asks for your password):")
-        if pkgs is None:
-            if need:
-                sys.exit("  Couldn't find apt, dnf or pacman. Install PyGObject with GTK 4, "
-                         "Pillow and pycairo, then run this again.")
-        elif not run(["/usr/bin/sudo", *pkgs[0], *pkgs[1]]) and need:
-            sys.exit("  Installing the dependencies failed (see above).")
+        if not run(["/usr/bin/sudo", *pkgs[0], *pkgs[1]]):
+            sys.exit("  Installing the dependencies failed (see above). On Ubuntu/Debian, "
+                     "`sudo apt update` first can help.")
     else:
         print("1/3 Dependencies: already there.")
+    if pkgs and pkgs[2]:                       # extras: nice to have, never a reason to stop
+        print("  Extras (tray icon / notifications):")
+        if not run(["/usr/bin/sudo", *pkgs[0], *pkgs[2]]):
+            print("  (Skipped the extras; snypshot works without them.)")
 
     print("2/3 Installing snypshot to /usr/local/bin:")
     if not _ours(BIN):
@@ -320,10 +343,12 @@ def setup():
             py = f.read()
         if not (_ours_py(KDE_PY) and _ours(KWIN_DESKTOP) and sudo_install(py, KDE_PY)
                 and sudo_install(KWIN_DESKTOP_CODE.encode(), KWIN_DESKTOP, "644")):
-            print("  (Couldn't set up fast KWin screenshots; snypshot will use Spectacle.)")
+            print("  (Couldn't set up fast KWin screenshots; snypshot will use Spectacle, "
+                  "which is slower.)")
         elif subprocess.run([KDE_PY, "-I", "-c", "import gi, PIL, cairo"],
                             capture_output=True).returncode != 0:
-            print("  (snypshot's Python copy doesn't work here; snypshot will use Spectacle.)")
+            print("  (snypshot's Python copy doesn't work here; snypshot will use Spectacle, "
+                  "which is slower.)")
             subprocess.run(["/usr/bin/sudo", "/usr/bin/rm", "-f", KDE_PY, KWIN_DESKTOP])
         for old in (OLD_KWIN_DESKTOP, OLD_KDE_PY):     # test builds put them here
             if os.path.exists(old) and (_ours(old) if old.endswith(".desktop") else _ours_py(old)):
@@ -359,7 +384,7 @@ import signal
 import subprocess
 import time
 
-from PIL import Image, ImageColor, ImageDraw, ImageFont
+from PIL import Image, ImageColor, ImageDraw
 
 WAYLAND = (bool(os.environ.get("WAYLAND_DISPLAY"))
            or os.environ.get("XDG_SESSION_TYPE") == "wayland")
@@ -371,7 +396,7 @@ TOOLS = ["pen", "line", "arrow", "rect", "marker", "text"]
 DRAW_TOOLS = ("pen", "line", "arrow", "rect", "marker")
 TIPS = {"pen": "Pen", "line": "Line", "arrow": "Arrow", "rect": "Rectangle",
         "marker": "Marker", "text": "Text", "color": "Color", "undo": "Undo (Ctrl+Z)",
-        "copy": "Copy (Ctrl+C)", "save": "Save (Ctrl+S)", "close": "Close (Esc)",
+        "copy": "Copy (Ctrl+C)", "save": "Save as (Ctrl+Shift+S)", "close": "Close (Esc)",
         "print": "Print (Ctrl+P)"}
 
 # The 48 "Basic colors" from the classic Windows color dialog Lightshot uses.
@@ -529,7 +554,8 @@ EXT_METADATA = """{
   "uuid": "snypshot@io.github.snypshot",
   "name": "snypshot helper",
   "description": "Hands screenshots to the snypshot screenshot tool instantly, without the portal's sound and flash. It never gives screenshots to anything except a verified, root-installed copy of snypshot.",
-  "shell-version": ["45", "46", "47", "48", "49", "50"]
+  "shell-version": ["45", "46", "47", "48", "49", "50", "51"],
+  "session-modes": ["user", "unlock-dialog"]
 }
 """
 
@@ -598,6 +624,30 @@ function rootOwned(path) {
     } catch (e) {
         return false;
     }
+}
+
+// PYTHON is /usr/bin/python3, a symlink to the real (versioned) binary. Follow it, but
+// only through links owned by root in root-owned folders, to a root-owned file. (Not
+// pinning python3.12 itself means a distro upgrade to a newer Python doesn't break us.)
+function resolvePython(path) {
+    try {
+        for (let i = 0; i < 10; i++) {
+            const info = Gio.File.new_for_path(path).query_info(
+                'unix::uid,standard::is-symlink,standard::symlink-target',
+                Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null);
+            if (!info.get_is_symlink())
+                return rootOwned(path) ? path : null;
+            const dir = GLib.path_get_dirname(path);
+            if (info.get_attribute_uint32('unix::uid') !== 0 || !rootOwned(dir))
+                return null;
+            let target = info.get_symlink_target();
+            if (!GLib.path_is_absolute(target))
+                target = GLib.build_filenamev([dir, target]);
+            path = GLib.canonicalize_filename(target, null);
+        }
+    } catch (e) {
+    }
+    return null;
 }
 
 function tracerOf(pid) {
@@ -684,7 +734,8 @@ export default class ShotHelper extends Extension {
     _start() {
         if (this._proc || !this._enabled)
             return;
-        if (!rootOwned(SCRIPT) || !rootOwned(PYTHON)) {
+        const python = resolvePython(PYTHON);
+        if (!rootOwned(SCRIPT) || !python) {
             this._why = `refusing: ${SCRIPT} or ${PYTHON} is not a root-owned install`;
             console.warn(`snypshot helper: ${this._why}`);
             return;
@@ -703,7 +754,7 @@ export default class ShotHelper extends Extension {
         launcher.set_cwd('/');
         let proc;
         try {
-            proc = launcher.spawnv([PYTHON, '-I', SCRIPT, '--daemon', '--foreground', '--helper']);
+            proc = launcher.spawnv([python, '-I', SCRIPT, '--daemon', '--foreground', '--helper']);
         } catch (e) {
             this._why = `could not start snypshot: ${e.message}`;
             return;
@@ -853,13 +904,31 @@ export default class ShotHelper extends Extension {
         const frame = new Uint8Array(header.length + data.length);
         frame.set(header, 0);
         frame.set(data, header.length);
-        this._stdin.write_all_async(frame, GLib.PRIORITY_DEFAULT, null, (s, res) => {
-            try {
-                s.write_all_finish(res);
-            } catch (e) {
-                console.warn(`snypshot helper: could not hand over screenshot: ${e.message}`);
-            }
-        });
+        // One write at a time (a stream allows only one pending write): queue the rest.
+        const stdin = this._stdin;
+        if (!this._outq || this._outStream !== stdin) {
+            this._outq = [];
+            this._outStream = stdin;
+            this._writing = false;
+        }
+        this._outq.push(frame);
+        const pump = () => {
+            if (this._writing || !this._outq.length || this._outStream !== stdin)
+                return;
+            this._writing = true;
+            stdin.write_all_async(this._outq.shift(), GLib.PRIORITY_DEFAULT, null, (s, res) => {
+                this._writing = false;
+                try {
+                    s.write_all_finish(res);
+                } catch (e) {
+                    console.warn(`snypshot helper: could not hand over screenshot: ${e.message}`);
+                    this._outq = [];
+                    return;
+                }
+                pump();
+            });
+        };
+        pump();
     }
 
     // Make sure snypshot is running (e.g. Print Screen right after it crashed). This can't
@@ -1029,6 +1098,7 @@ def helper_expected():
     if not os.path.isfile(os.path.join(ext_dir(), "extension.js")) or not have("gsettings"):
         return False
     return (EXT_UUID in gset("get", "org.gnome.shell", "enabled-extensions")
+            and EXT_UUID not in gset("get", "org.gnome.shell", "disabled-extensions")
             and gset("get", "org.gnome.shell", "disable-user-extensions") != "true")
 
 
@@ -1049,8 +1119,8 @@ def install_extension():
     if "gnome" not in os.environ.get("XDG_CURRENT_DESKTOP", "").lower():
         print("The helper extension is only for GNOME; skipping it.")
         return
-    if not root_owned(os.path.realpath(sys.executable)):
-        print(f"Not installing the helper: {sys.executable} isn't a root-owned system Python.")
+    if not root_owned("/usr/bin/python3"):
+        print("Not installing the helper: /usr/bin/python3 isn't a root-owned system Python.")
         return
     if not root_owned(SCRIPT):
         print(f"Not installing the helper: {SCRIPT} can be changed without root, so the\n"
@@ -1067,7 +1137,7 @@ def install_extension():
         f.write(EXT_METADATA)
     with open(os.path.join(d, "extension.js"), "w") as f:
         f.write(EXT_JS_TEMPLATE.replace("@SCRIPT@", json.dumps(SCRIPT))
-                .replace("@PYTHON@", json.dumps(os.path.realpath(sys.executable))))
+                .replace("@PYTHON@", json.dumps("/usr/bin/python3")))
     enabled = False
     if have("gnome-extensions"):
         enabled = subprocess.run([T("gnome-extensions"), "enable", EXT_UUID],
@@ -1287,7 +1357,8 @@ def grab_screen():
     hint = ("gnome-screenshot is installed but isn't working - details in ~/.cache/snypshot/snypshot.log"
             if ("gnome" in desktop or "unity" in desktop) and have("gnome-screenshot")
             else "sudo apt install gnome-screenshot" if "gnome" in desktop or "unity" in desktop
-            else "sudo apt install kde-spectacle" if "kde" in desktop
+            else "install Spectacle (kde-spectacle on Ubuntu/Debian, spectacle on Fedora/Arch)"
+            if "kde" in desktop
             else "install grim (sway/Hyprland), gnome-screenshot (GNOME) or spectacle (KDE)")
     sys.exit(f"snypshot: couldn't capture the screen on this Wayland desktop "
              f"({desktop or 'unknown'}).\nFix: {hint}")
@@ -1520,18 +1591,6 @@ def update_config(**changes):
     return load_config()
 
 
-def load_font(px):
-    for name in ("DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf", "FreeSansBold.ttf"):
-        try:
-            return ImageFont.truetype(name, px)
-        except OSError:
-            pass
-    try:
-        return ImageFont.load_default(size=px)
-    except TypeError:
-        return ImageFont.load_default()
-
-
 WATERMARK = "Screenshot taken with snypshot"
 WATERMARK_PX = 11                  # text height, in desktop units (like on screen)
 WATERMARK_MARGIN = 6
@@ -1540,23 +1599,6 @@ WATERMARK_MARGIN = 6
 def watermark_fits(w, h, tw, th, m):
     """Only on screenshots big enough that it doesn't cover the picture."""
     return w >= tw + 2 * m + 40 and h >= 3 * (th + 2 * m)
-
-
-def add_watermark(img, s):
-    """"Screenshot taken with snypshot" in the bottom-right corner: small, white with a soft dark
-    edge so it reads on any background. Preferences > Saving turns it off."""
-    font = load_font(max(8, round(WATERMARK_PX * s)))
-    m = round(WATERMARK_MARGIN * s)
-    edge = max(1, round(s))
-    x0, y0, x1, y1 = font.getbbox(WATERMARK, stroke_width=edge)
-    tw, th = x1 - x0, y1 - y0
-    if not watermark_fits(img.width, img.height, tw, th, m):
-        return img
-    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    ImageDraw.Draw(layer).text((img.width - m - tw - x0, img.height - m - th - y0), WATERMARK,
-                               font=font, fill=(255, 255, 255, 128), stroke_width=edge,
-                               stroke_fill=(0, 0, 0, 50))   # see-through
-    return Image.alpha_composite(img.convert("RGBA"), layer)
 
 
 def stroke(draw, pts, col, w):
@@ -1670,6 +1712,12 @@ def init_gtk():
         if not os.environ.get("WAYLAND_DISPLAY"):
             sys.exit("snypshot: Wayland session but no WAYLAND_DISPLAY; refusing to use X11")
         os.environ["GDK_BACKEND"] = "wayland"
+    # Graphics drivers can load add-ons ("layers") listed in folders any program running
+    # as you can write to; nothing like that belongs in the process holding screenshots.
+    os.environ["VK_LOADER_LAYERS_DISABLE"] = "~all~"
+    os.environ["GDK_DISABLE"] = "vulkan"             # (GTK 4.16+; OpenGL is plenty here)
+    os.environ["GSK_RENDERER"] = "ngl"
+    os.environ["XDG_DATA_DIRS"] = "/usr/local/share:/usr/share"   # system folders only
     import gi
     gi.require_version("Gtk", "4.0")
     gi.require_version("Gdk", "4.0")
@@ -1991,7 +2039,7 @@ class Overlay:
 
     def tip_text(self, key):
         """Tooltip, with your current shortcut: "Save (Ctrl+S)"."""
-        action = {"copy": "copy", "save": "save", "undo": "undo", "print": "print"}.get(key)
+        action = {"copy": "copy", "save": "save_as", "undo": "undo", "print": "print"}.get(key)
         base = TIPS[key].split(" (")[0]
         accel = self.cfg.get("keys", DEFAULT_KEYS).get(action) if action else None
         if key == "close":
@@ -2126,6 +2174,10 @@ class Overlay:
         if self.dialog_open:
             self.cancel_dialog()
             return
+        if self.drag and self.drag[0] == "draw":  # mid-stroke: drop just this stroke
+            self.cur = self.drag = self.ring = None
+            self.redraw()
+            return
         if self.entry:
             self.cancel_text()
         elif self.picker:
@@ -2188,6 +2240,7 @@ class Overlay:
         return None
 
     def press(self, x, y):
+        self.drag_start, self.drag_moved = (x, y), False
         if self.entry:
             part = self.typing_part(x, y)
             if part == "handle":                  # drag the corner: bigger / smaller text
@@ -2229,6 +2282,7 @@ class Overlay:
             if self.tool:
                 self.cur = {"type": self.tool, "color": self.color, "width": self.width,
                             "pts": [(x, y)]}
+                self.last_pt = (x, y)             # (not where the previous stroke ended)
                 self.drag = ("draw",)
                 self.redraw()
                 return
@@ -2249,6 +2303,11 @@ class Overlay:
         self.mouse = (x, y)
         if not d:
             return
+        if d[0] in ("move", "resize") and d[1:2] and not getattr(self, "drag_moved", False):
+            ox, oy = self.drag_start
+            if abs(x - ox) <= 2 and abs(y - oy) <= 2:
+                return                            # (just a click so far: toolbars stay)
+            self.drag_moved = True
         if d[0] == "ui":                          # holding a button down
             return
         if d[0] == "pending":
@@ -2287,7 +2346,7 @@ class Overlay:
             px = int(max(self.S(8), min(self.S(300), d[2] + (y - d[1]))))
             self.entry["px"] = px
             # keep the scroll-wheel size in step, so scrolling continues from here
-            self.width = max(1, min(20, round((px / self.k - 10) / 3)))
+            self.width = max(1, min(20, round((px - 10) / 3)))
             self.redraw()
             return
         self.render_ui()
@@ -2412,7 +2471,9 @@ class Overlay:
             self.after_cancel(self.flash_job)
             self.flash_job = None
         if self.entry:                            # typing: resize the text itself, live
-            self.entry["px"] = self.text_px(self.width)
+            px = self.entry["px"]                 # (in steps that suit its size, so text
+            step = max(2, round(px * 0.1))        # made big with the handle grows too)
+            self.entry["px"] = max(8, min(300, px + d * step))
             self.redraw()
             return
         if self.tool == "text":
@@ -2433,6 +2494,10 @@ class Overlay:
 
     def mon_at(self, x, y):
         """(x0, y0, x1, y1) of the monitor at a point, or the nearest one."""
+        for mx, my, mw, mh in self.monitors:      # (edges: a point on the seam belongs
+            if mx <= x < mx + mw and my <= y < my + mh:   # to the monitor it starts)
+                return mx, my, mx + mw, my + mh
+
         def dist(m):
             mx, my, mw, mh = m
             dx = max(mx - x, 0, x - (mx + mw))
@@ -2508,17 +2573,10 @@ class Overlay:
         else:
             self.label_box(x0 + k(4), y0 + k(4), label, self.f_bold)
 
-        if self.cfg.get("watermark", True):       # what it'll look like (Preferences > Saving)
-            desc = self.fonts.desc(WATERMARK_PX, True)
-            tw, th = self.fonts.size(WATERMARK, desc)
-            m = WATERMARK_MARGIN
-            if watermark_fits(x1 - x0, y1 - y0, tw, th, m):
-                tx, ty = x1 - m - tw, y1 - m - th / 2
-                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                    self.op("text", tx + dx, ty + dy, WATERMARK, desc, "#000000", "w", 0.12)
-                self.op("text", tx, ty, WATERMARK, desc, "#ffffff", "w", 0.5)
+        self.ui_ops += self.watermark_ops()       # what it'll look like (Preferences > Saving)
 
-        if self.drag and self.drag[0] in ("new", "move", "resize"):
+        if self.drag and (self.drag[0] == "new" or (self.drag[0] in ("move", "resize")
+                                                     and getattr(self, "drag_moved", False))):
             return                                # Lightshot hides toolbars while dragging
 
         b, pad, gap = self.btn, k(3), k(6)
@@ -3075,10 +3133,10 @@ class Overlay:
     # --- drawings
 
     def line_px(self, width):
-        return max(1, round(width * self.k))
+        return max(1, round(width))               # (drawings don't follow the toolbar size)
 
     def text_px(self, width):
-        return round((10 + width * 3) * self.k)
+        return round(10 + width * 3)
 
     def item_ops(self, a):
         """Shapes for one drawing - the same geometry the saved image uses."""
@@ -3287,9 +3345,13 @@ class Overlay:
                 return
 
     def undo(self):
-        if self.entry:
-            self.cancel_text()
-        elif self.annots:
+        if self.entry:                            # typing: undo the text as a whole, but
+            n = len(self.annots)                  # so that Ctrl+Y brings it back
+            self.commit_text()
+            if len(self.annots) == n:
+                self.redraw()
+                return
+        if self.annots:
             a = self.annots.pop()
             self.undone.append(a)
             old = a.get("replaces")
@@ -3324,7 +3386,8 @@ class Overlay:
                 order_g = sorted(range(len(gd)), key=lambda j: (gd[j][1], gd[j][0]))
                 x, y, w, h = gd[order_g[order_c.index(i)]]
             parts.append({"rect": (x - ox, y - oy, w, h), "img": img,
-                          "scale": img.width / max(1, w)})
+                          "scale": img.width / max(1, w),
+                          "scale_y": img.height / max(1, h)})   # (can differ a hair on KDE)
         return parts
 
     def out_scale(self, sel):
@@ -3502,6 +3565,24 @@ class Overlay:
         # Every edge is placed at round(distance from the selection's corner * s), and
         # each piece is exactly as wide as the gap between its edges, so a selection on
         # one monitor is copied pixel for pixel (never resampled), at any scale.
+        hits = [p for p in self.parts if p["rect"][0] < x1 and p["rect"][0] + p["rect"][2] > x0
+                and p["rect"][1] < y1 and p["rect"][1] + p["rect"][3] > y0]
+        if len(hits) == 1 and abs(hits[0]["scale"] - s) < 1e-9:
+            # All on one monitor: its own pixels, 1:1. (Per axis: on some fractional
+            # scales the monitor's height in desktop units is rounded, so its vertical
+            # scale is a hair different - using it keeps edges exact.)
+            p = hits[0]
+            px, py, pw, ph = p["rect"]
+            im, sy = p["img"], p.get("scale_y", s)
+            if abs(sy - s) > s * 0.01:            # (only a rounding hair, never more)
+                sy = s
+            box = (round((max(x0, px) - px) * s), round((max(y0, py) - py) * sy),
+                   round((min(x1, px + pw) - px) * s), round((min(y1, py + ph) - py) * sy))
+            box = (max(0, min(box[0], im.width - 1)), max(0, min(box[1], im.height - 1)),
+                   max(1, min(box[2], im.width)), max(1, min(box[3], im.height)))
+            if box[2] > box[0] and box[3] > box[1] and (x0, y0) >= (px, py) \
+                    and x1 <= px + pw and y1 <= py + ph:
+                return im.crop(box)
         ex = lambda v: round((v - x0) * s)
         ey = lambda v: round((v - y0) * s)
         out = Image.new("RGB", (max(1, ex(x1)), max(1, ey(y1))))
@@ -3520,8 +3601,24 @@ class Overlay:
                 cx, cy = min(max(0, cx), im.width - 1), min(max(0, cy), im.height - 1)
                 piece = im.crop((cx, cy, min(cx + w, im.width), min(cy + h, im.height)))
             else:
-                piece = im.crop((cx, cy, round((ix1 - px) * ps), round((iy1 - py) * ps)))
-            if piece.size != (w, h):
+                box = (max(0, cx), max(0, cy), min(im.width, round((ix1 - px) * ps)),
+                       min(im.height, round((iy1 - py) * ps)))
+                piece = im.crop(box) if box[2] > box[0] and box[3] > box[1] else \
+                    Image.new("RGB", (1, 1))
+            if piece.size != (w, h) and ps == s and w - piece.width <= 2 \
+                    and h - piece.height <= 2:
+                # a pixel short at the monitor's edge (rounding): repeat the edge rather
+                # than resampling (blurring) the whole piece
+                full = Image.new("RGB", (w, h))
+                full.paste(piece, (0, 0))
+                if w > piece.width:
+                    full.paste(piece.crop((piece.width - 1, 0, piece.width, piece.height))
+                               .resize((w - piece.width, piece.height)), (piece.width, 0))
+                if h > piece.height:
+                    full.paste(full.crop((0, piece.height - 1, w, piece.height))
+                               .resize((w, h - piece.height)), (0, piece.height))
+                piece = full
+            elif piece.size != (w, h):
                 piece = piece.resize((w, h), Image.LANCZOS)
             out.paste(piece, (ex(ix0), ey(iy0)))
         return out
@@ -3529,11 +3626,12 @@ class Overlay:
     def render(self):
         x0, y0, x1, y1 = self.sel
         s = self.out_scale(self.sel)
-        sx = sy = s
         base = self.compose(self.sel, s).convert("RGBA")
+        sx, sy = base.width / max(1, x1 - x0), base.height / max(1, y1 - y0)   # (about s)
         marks = Image.new("RGBA", base.size, (0, 0, 0, 0))
         ink = Image.new("RGBA", base.size, (0, 0, 0, 0))
         dm, di = ImageDraw.Draw(marks), ImageDraw.Draw(ink)
+        texts = []
 
         for a in self.annots:
             col = hex_rgb(a["color"]) + (255,)
@@ -3563,13 +3661,43 @@ class Overlay:
                 di.polygon([(bx2, by2), (hx + nx * half, hy + ny * half),
                             (hx - nx * half, hy - ny * half)], fill=col)
             elif t == "text":
-                di.text(pts[0], a["text"], fill=col, font=load_font(round(a["px"] * s)))
+                texts.append(a)                   # (drawn below, the same way as on screen)
 
         marks.putalpha(marks.getchannel("A").point(lambda v: v * 45 // 100))
         out = Image.alpha_composite(Image.alpha_composite(base, marks), ink)
-        if self.cfg.get("watermark", True):
-            out = add_watermark(out, s)
+        wm = self.watermark_ops()
+        if texts or wm:
+            # Text and the watermark with Pango, exactly like on screen (font fallback for
+            # Chinese, Japanese, emoji; right-to-left shaping), at the output's scale.
+            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, out.width, out.height)
+            cr = cairo.Context(surf)
+            cr.scale(sx, sy)
+            cr.translate(-x0, -y0)
+            for a in texts:
+                self.paint_ops(cr, self.item_ops(a))
+            self.paint_ops(cr, wm)
+            surf.flush()
+            layer = Image.frombuffer("RGBA", (out.width, out.height), bytes(surf.get_data()),
+                                     "raw", "BGRa", surf.get_stride(), 1)
+            out = Image.alpha_composite(out, layer)
         return out.convert("RGB")
+
+    def watermark_ops(self):
+        """ "Screenshot taken with snypshot" in the selection's bottom-right corner, if
+        it's on (Preferences > Saving) and the selection is big enough for it. The same
+        drawing is used on screen and in the saved image, so they always match."""
+        if not self.cfg.get("watermark", True) or not self.sel:
+            return []
+        x0, y0, x1, y1 = self.sel
+        desc = self.fonts.desc(WATERMARK_PX, True)
+        tw, th = self.fonts.size(WATERMARK, desc)
+        m = WATERMARK_MARGIN
+        if not watermark_fits(x1 - x0, y1 - y0, tw, th, m):
+            return []
+        tx, ty = x1 - m - tw, y1 - m - th / 2
+        return ([("text", tx + dx, ty + dy, WATERMARK, desc, "#000000", "w", 0.12)
+                 for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))]
+                + [("text", tx, ty, WATERMARK, desc, "#ffffff", "w", 0.5)])
 
     def copy(self):
         if not self.sel or self.drag:
@@ -3619,7 +3747,7 @@ class Overlay:
         file is written next to its final name and swapped in at the end, so a failed
         save (disk full...) never leaves half a file, and a symlink planted at that name
         gets replaced instead of written through."""
-        if not os.path.splitext(path)[1]:
+        if os.path.splitext(path)[1].lower() not in (".png", ".jpg", ".jpeg"):
             path += ".jpg" if self.cfg.get("format") == "jpg" else ".png"
             exclusive = True           # the dialog only checked the name without it
         fmt = "JPEG" if path.lower().endswith((".jpg", ".jpeg")) else "PNG"
@@ -3791,7 +3919,7 @@ class Overlay:
             if self.closed or not self.dialog_open:
                 return False
             try:
-                win = PrintWindow(img, folder, pdf_name, finish)
+                win = PrintWindow(img, folder, pdf_name, finish, self.out_scale(self.sel))
                 self.dialog_win = win
                 win.present()
             except Exception as e:
@@ -3933,7 +4061,7 @@ class PrintWindow:
     else the chosen printer offers (read from the printer, not hard-coded). Printing
     goes through CUPS (lp) with a PDF snypshot draws itself."""
 
-    def __init__(self, img, folder, pdf_name, on_finish):
+    def __init__(self, img, folder, pdf_name, on_finish, px_scale=1.0):
         self.win = Gtk.Window(title="Print")
         self.img, self.folder, self.pdf_name, self.on_finish = img, folder, pdf_name, on_finish
         self.busy = False
@@ -3945,6 +4073,7 @@ class PrintWindow:
         small.thumbnail((1600, 1600))
         self.small = {False: small.convert("RGBA"), True: small.convert("L").convert("RGBA")}
         self.small_scale = small.width / img.width
+        self.px_scale = px_scale or 1.0            # image pixels per screen unit (2 on 200%)
         self.win.set_default_size(960, 660)
         global _print_css
         if not _print_css:                         # (once per run)
@@ -4107,6 +4236,7 @@ class PrintWindow:
             self.picked = True
         gen, name = self.gen, self.dest_name()
         if name == PDF_DEST:
+            self.go.set_sensitive(not self.busy)
             self.show_options([])
             return
         self.status.set_label("Getting the printer's settings...")
@@ -4186,7 +4316,7 @@ class PrintWindow:
             cr.translate(vw, 0)
             cr.rotate(math.pi / 2)
         draw_page(cr, pw, ph, self.small[o["gray"]], landscape=o["landscape"], fit=o["fit"],
-                  gray=False, unit=self.small_scale)
+                  gray=False, unit=self.small_scale * self.px_scale)
         surf.flush()
         buf = io.BytesIO()
         surf.write_to_png(buf)
@@ -4224,7 +4354,7 @@ class PrintWindow:
             o["landscape"] = False
         surf = C.PDFSurface(path, pw, ph)
         cr = C.Context(surf)
-        draw_page(cr, pw, ph, self.img, **o)
+        draw_page(cr, pw, ph, self.img, unit=self.px_scale, **o)
         cr.show_page()
         surf.finish()
 
@@ -5004,17 +5134,17 @@ def refresh_kde_menus():
     """KWin reads app permissions from KDE's app database; make sure it's current. Once
     with our environment, and once with the session's (what KWin itself started with:
     the database is kept per set of folders, and a terminal's list can differ)."""
-    tool = next((t for t in ("kbuildsycoca5", "kbuildsycoca6") if have(t)), None)
-    if not tool:
-        return
-    cmds = [[T(tool)]]
-    if have("systemd-run"):
-        cmds.append([T("systemd-run"), "--user", "--wait", "--quiet", "--collect", T(tool)])
-    for cmd in cmds:
-        try:
-            subprocess.run(cmd, env=clean_env(), capture_output=True, timeout=60)
-        except (OSError, subprocess.TimeoutExpired) as e:
-            log(f"{tool} didn't finish: {e}")
+    for tool in ("kbuildsycoca6", "kbuildsycoca5"):   # (both, if both KDE versions are there)
+        if not have(tool):
+            continue
+        cmds = [[T(tool)]]
+        if have("systemd-run"):
+            cmds.append([T("systemd-run"), "--user", "--wait", "--quiet", "--collect", T(tool)])
+        for cmd in cmds:
+            try:
+                subprocess.run(cmd, env=clean_env(), capture_output=True, timeout=60)
+            except (OSError, subprocess.TimeoutExpired) as e:
+                log(f"{tool} didn't finish: {e}")
 
 
 def kde_py_current():
@@ -5221,6 +5351,7 @@ class Daemon:
 
     def __init__(self, capture_now, helper=False):
         global HELPER
+        os.chdir("/")                             # (never load anything from where we started)
         if helper:                                # started by the GNOME helper extension
             parent = ""
             try:
@@ -5293,6 +5424,10 @@ class Daemon:
                 self.kde_keys = KdeShortcut(self)
             except Exception as e:
                 log(f"KDE shortcut service not available: {e}")
+            if os.path.isfile(KDE_PY) and not kde_py_current():
+                log("Python was updated; snypshot's copy is out of date (using Spectacle)")
+                notify("Python was updated, so screenshots are slower for now. Run "
+                       "`snypshot --setup` once to make them instant again.")
 
         for sig in (signal.SIGTERM, signal.SIGINT):
             GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, self.quit)
@@ -5501,9 +5636,10 @@ PartOf=graphical-session.target
 After=graphical-session.target
 StartLimitIntervalSec=120
 StartLimitBurst=10
+ConditionEnvironment=XDG_CURRENT_DESKTOP=KDE
 
 [Service]
-ExecStart="{script}" --service
+ExecStart=/usr/bin/python3 -I "{script}" --service
 Restart=on-failure
 RestartSec=3
 
@@ -5552,10 +5688,14 @@ def install_service():
 def remove_service():
     if os.path.exists(service_file()):
         systemctl("disable", "--now", SERVICE)
-        try:
-            os.remove(service_file())
-        except OSError:
-            pass
+        wants = os.path.join(os.path.dirname(service_file()),
+                             "graphical-session.target.wants", SERVICE)
+        for f in (wants, service_file()):     # (also if systemctl couldn't be reached)
+            try:
+                if f == service_file() or os.path.islink(f):
+                    os.remove(f)
+            except OSError:
+                pass
         systemctl("daemon-reload")
 
 
@@ -5567,8 +5707,12 @@ def install(gnome_helper=False):
     home_data = xdg("XDG_DATA_HOME", "~/.local/share")
     folders = {os.path.join(home_data, "applications"): "--preferences"}  # app menu: settings
     autostart = os.path.join(home_cfg, "autostart", "snypshot.desktop")
-    service = is_kde() and install_service()
-    if gnome_helper or service:       # the GNOME helper / the service starts it at login
+    # KDE: a service that restarts it if it ever dies. The autostart entry stays too, as
+    # a backup for sessions that don't start services (it goes through the service).
+    service = is_kde() and root_owned(SCRIPT) and install_service()
+    if not is_kde():
+        remove_service()              # (from a KDE session on the same account)
+    if gnome_helper:                  # the GNOME helper starts snypshot itself at login
         try:
             os.remove(autostart)
         except OSError:
@@ -5921,6 +6065,29 @@ def unbind_key():
     print("Print Screen is back to GNOME's screenshot tool.")
 
 
+def wait_gone(timeout=5.0):
+    """After asking the background copy to quit: wait until the process has really
+    gone (it lets go of its lock only when it exits), not just stopped answering."""
+    import fcntl
+    path = os.path.join(RUNTIME_DIR, "snypshot", "daemon.lock")
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return True
+        except BlockingIOError:
+            pass
+        finally:
+            os.close(fd)
+        time.sleep(0.05)
+    return False
+
+
 def replace_old_daemon():
     """After an update, the background copy is still running the OLD code (Python loaded
     it at login). If it isn't this version, stop it; the GNOME helper (or the code
@@ -5929,10 +6096,7 @@ def replace_old_daemon():
         return
     log(f"replacing an older running copy with {VERSION}")
     send("quit")
-    for _ in range(60):
-        if send("ping") != "ok":
-            break
-        time.sleep(0.05)
+    wait_gone()
     if helper_active() or helper_expected():
         for _ in range(50):                       # helper allows one Start() a second
             try:
@@ -5951,9 +6115,27 @@ def replace_old_daemon():
             time.sleep(0.1)
 
 
+FLAGS = {"--setup", "--install", "--uninstall", "--preferences", "--doctor", "--test-capture",
+         "--quit", "--once", "--daemon", "--foreground", "--capture", "--helper", "--service",
+         "--tray", "--version", "--allow-portal", "--disallow-portal", "--bind-key",
+         "--unbind-key", "--install-extension", "--from-setup", "--help", "-h"}
+
+
 def main():
     args = sys.argv[1:]
+    if "--help" in args or "-h" in args:
+        print((__doc__ or "").split("\nPrivacy:")[0].strip())
+        return
+    odd = [a for i, a in enumerate(args) if a not in FLAGS
+           and not (i and args[i - 1] == "--tray")]
+    if odd:
+        sys.exit(f"snypshot: unknown option {odd[0]!r} (see snypshot --help)")
     if "--service" in args:                       # started by the user service (KDE)
+        if not is_kde():
+            return                                # (a GNOME session on the same account)
+        if not os.environ.get("WAYLAND_DISPLAY") and os.environ.get("XDG_SESSION_TYPE") != "x11":
+            log("service: the session hasn't told systemd about the screen yet; retrying")
+            sys.exit(1)                           # (never fall back to X11 by accident)
         py = daemon_python()
         os.execve(py, [py, "-I", SCRIPT, "--daemon", "--foreground"], clean_env())
     if "--bind-key" in args:
@@ -5971,7 +6153,9 @@ def main():
         replace_old_daemon()
         running = send("version") if send("ping") == "ok" else None
         if running and running != BUILD:
-            running = running.split()[0] + (" (an older copy; run snypshot --quit, then "
+            running = running.split()[0] + (" (an older copy; run: systemctl --user restart "
+                                             "snypshot)" if use_service() else
+                                             " (an older copy; run snypshot --quit, then "
                                              "snypshot --daemon)" if is_kde() else
                                              " (an older copy; press Print Screen to update it)")
         elif running:
@@ -6023,10 +6207,7 @@ def main():
         if is_kde():
             if install() and send("ping") == "ok":   # now there's a service: hand over to it
                 send("quit")                      # (a copy it didn't start can't be
-                for _ in range(50):               # restarted by it)
-                    if send("ping") != "ok":
-                        break
-                    time.sleep(0.1)
+                wait_gone()                       # restarted by it)
             bound = bind_key()
         else:
             bound = bind_key()
@@ -6059,10 +6240,7 @@ def main():
                     break
                 time.sleep(2)
                 send("quit")
-                for _ in range(50):
-                    if send("ping") != "ok":
-                        break
-                    time.sleep(0.1)
+                wait_gone()
                 start_bg()
         if "--from-setup" in args:
             print()
@@ -6076,7 +6254,9 @@ def main():
                           "uses Spectacle for now (slower).\nLog out and back in once "
                           "whenever you like to make it instant.")
             elif helper_active():
-                print("Done! Press Print Screen.")
+                key = accel_label_plain(load_config()["hotkey"] or "")
+                print(f"Done! Press {key}." if bound and key else
+                      "Done! Pick a screenshot key in snypshot's Preferences (in your app menu).")
             elif moved and send("ping") == "ok":
                 print("Done! Print Screen works now (your settings came along from shot).\n"
                       "Log out and back in once whenever you like to finish the switch.")
@@ -6096,14 +6276,22 @@ def main():
         files += [f for f in (KWIN_DESKTOP, OLD_KWIN_DESKTOP) if os.path.exists(f) and _ours(f)]
         if files and os.geteuid() != 0:
             print("Removing the program itself (asks for your password):")
-            subprocess.run([T("sudo"), "/usr/bin/rm", "-f", "--", *files], env=clean_env())
+            try:
+                gone = subprocess.run([T("sudo"), "/usr/bin/rm", "-f", "--", *files],
+                                      env=clean_env()).returncode == 0
+            except (OSError, FileNotFoundError):
+                gone = False
             for d in (os.path.dirname(KDE_PY), os.path.dirname(OLD_KDE_PY)):
                 if os.path.isdir(d):
                     subprocess.run([T("sudo"), "/usr/bin/rmdir", "--", d], env=clean_env(),
                                    capture_output=True)
+            if not gone:
+                sys.exit("Couldn't remove " + ", ".join(files) + ". Run snypshot --uninstall "
+                         "again, or remove them with sudo rm.")
         print("snypshot is gone. Your settings are in ~/.config/snypshot if you want them.")
         return
     if "--once" in args:
+        os.chdir("/")
         no_dumps()
         img = grab_screen()
         init_gtk()
@@ -6153,6 +6341,7 @@ def main():
         log("the GNOME helper didn't start snypshot; running it directly")
 
     if "--foreground" not in args and use_service():   # KDE: through the user service
+        systemctl("reset-failed", SERVICE)        # (in case it gave up after many restarts)
         if systemctl("start", SERVICE):
             for _ in range(100):
                 if send("ping") == "ok":

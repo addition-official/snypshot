@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.1.2
+
+**Fixed**
+- Chinese, Japanese, emoji and right-to-left text you type now comes out in the saved image exactly as on screen (it used to turn into empty boxes).
+- On KDE scaling like 130% or 145%, screenshots touching the bottom of the screen were a pixel too tall and slightly blurred; they're pixel-exact now. Mixed-scale screenshots no longer get a thin dark line at a monitor edge.
+- The watermark in the saved image now always matches the preview.
+- "Actual size" printing is right on 200% screens, and the Save button no longer stays greyed out after switching back to Save as PDF.
+- The editor: Esc while dragging a stroke drops it, Ctrl+Z while typing can be redone with Ctrl+Y, Shift at the start of a new line no longer jumps, the mouse wheel resizes big text properly, toolbars no longer blink on a plain click, and the Toolbar size setting no longer changes how thick your drawings are.
+- The Save button's tip now shows Ctrl+Shift+S (the key that does the same). Ctrl+S is still the instant save.
+- GNOME: the helper keeps working after a distro upgrade to a newer Python, supports GNOME 51, and doesn't close snypshot when the screen locks.
+- `snypshot --help` shows the commands; unknown options no longer take a screenshot.
+- Setup: the tray icon and notifications are optional extras (a missing one no longer stops setup), messages are accurate in more cases, and uninstall tells you if it couldn't remove something.
+
+**Security**
+- Setup can no longer be tricked by a file planted next to snypshot.py (for example in Downloads).
+- snypshot doesn't load graphics add-ons or fonts from folders other programs can write to.
+
 ## 1.1.1
 - On KDE, snypshot runs as a small user service and restarts itself within a few seconds if it ever crashes or loses the screen (for example when KWin restarts), so Print Screen never stays dead. Quitting it on purpose still stays quit.
 
