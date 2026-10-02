@@ -63,7 +63,7 @@ snypshot --doctor       check the setup and do a test capture (nothing is saved)
 snypshot --version      show the version
 snypshot --quit         stop the background copy
 snypshot --uninstall    remove snypshot completely
-snypshot --help         all of this
+snypshot --help         show this list of commands
 ```
 
 ## Why log out once on GNOME?
