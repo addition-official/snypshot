@@ -23,7 +23,7 @@ Works on **GNOME** and **KDE Plasma** on Wayland (tested on Ubuntu 24.04 and 26.
 
 ## Updating
 
-Download the new `snypshot.py` and run `python3 snypshot.py --setup` again. Your settings stay. On GNOME, log out and back in once afterwards so GNOME loads the updated helper (snypshot keeps working until you do).
+Download the new `snypshot.py` and run `python3 snypshot.py --setup` again. Your settings stay. On GNOME, log out and back in once afterwards so GNOME loads the updated helper (snypshot keeps working on the old version until you do).
 
 ## Using it
 
