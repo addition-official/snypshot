@@ -1,11 +1,9 @@
 # Changelog
 
-## Unreleased
+## 1.1.2
 
 **Changed**
 - Enter in a text box now starts a new line instead of finishing the text. Finish with Ctrl+Enter or a click outside, like before. Home / End go to the start / end of the line, and Up / Down move between lines.
-
-## 1.1.2
 
 **Fixed**
 - Chinese, Japanese, emoji and right-to-left text you type now comes out in the saved image exactly as on screen (it used to turn into empty boxes).
