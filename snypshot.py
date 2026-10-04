@@ -22,6 +22,7 @@ Install (GNOME or KDE Plasma on Wayland, tested on Ubuntu 24.04 and 26.04):
   Mouse wheel           down = bigger, up = smaller (brush / text size)
   Shift while drawing   straight 45-degree lines, square boxes
   Enter / Ctrl+C        copy to clipboard and close
+  Enter while typing    new line (Ctrl+Enter or a click outside finishes the text)
   Ctrl+S                save to a file
   Ctrl+P                print (or print to PDF)
   Ctrl+Z / Ctrl+Y       undo / redo
@@ -1806,6 +1807,29 @@ class Fonts:
         w, h = lay.get_pixel_size()
         return (w if text else 0), h
 
+    def _layout(self, text, desc):
+        lay = Pango.Layout.new(self.ctx)
+        lay.set_font_description(desc)
+        lay.set_text(text, -1)
+        return lay
+
+    def caret(self, text, i, desc):
+        """Where the cursor before character i goes: (x, y, height), relative to the text's
+        top-left. Works across lines."""
+        lay = self._layout(text, desc)
+        strong, _ = lay.get_cursor_pos(len(text[:i].encode()))
+        h = strong.height / Pango.SCALE
+        return strong.x / Pango.SCALE, strong.y / Pango.SCALE, h or self.size("", desc)[1]
+
+    def index_at(self, text, x, y, desc):
+        """Character boundary nearest to (x, y), relative to the text's top-left."""
+        lay = self._layout(text, desc)
+        _, byte, trailing = lay.xy_to_index(int(x * Pango.SCALE), int(y * Pango.SCALE))
+        i = len(text.encode()[:byte].decode(errors="ignore"))
+        if trailing and text[i:i + 1] != "\n":    # (past a line's end: stay on that line)
+            i += trailing
+        return max(0, min(len(text), i))
+
 
 class Overlay:
     """One screenshot session: fullscreen window(s) on every monitor, sharing one scene."""
@@ -2026,7 +2050,10 @@ class Overlay:
             return True
         action = self.shortcut_for(keyval, state, keycode)
         if name in ("Return", "KP_Enter"):
-            self.enter()
+            if self.entry and not ctrl:           # typing: Enter starts a new line,
+                self.on_key("Return", "\n")       # Ctrl+Enter finishes the text
+            else:
+                self.enter()
         elif action:
             {"copy": self.copy, "save": self.quick_save, "save_as": self.save_dialog,
              "print": self.print_dialog, "undo": self.undo, "redo": self.redo}[action]()
@@ -2273,7 +2300,7 @@ class Overlay:
                 i = self.text_at(x, y)
                 if i is not None:                 # click placed text: edit it again
                     self.edit_text(i)
-                    self.place_caret(x)
+                    self.place_caret(x, y)
                     self.drag = ("tmove", x - self.entry["x"], y - self.entry["y"], x, y)
                     self.tmoved = False
                 else:
@@ -2395,7 +2422,7 @@ class Overlay:
         if d[0] in ("sv", "hue") and self.picker and self.picker_editing() is not None:
             self.save_mine()                      # finished tweaking one of your colors
         if d[0] == "tmove" and self.entry and not self.tmoved:
-            self.place_caret(x)                   # a click in the text: move the cursor
+            self.place_caret(x, y)                # a click in the text: move the cursor
             return
         if d[0] == "new":
             x0, y0, x1, y1 = self.sel
@@ -3212,24 +3239,24 @@ class Overlay:
         t = self.entry
         x, y, text = t["x"], t["y"], t["text"]
         desc, w, h = self.text_size(text, t["px"])
-        cx = x + self.fonts.size(text[:t["caret"]], desc)[0]
+        cx, cy, ch = self.fonts.caret(text, t["caret"], desc)
         pad, hs = self.S(5), self.S(4)
         box = (x - pad, y - pad, x + w + pad, y + h + pad)
         t["bbox"] = box
         t["hbox"] = (box[2] - hs - self.S(3), box[3] - hs - self.S(3),
                      box[2] + hs + self.S(3), box[3] + hs + self.S(3))
-        return desc, box, hs, cx, h
+        return desc, box, hs, (x + cx, y + cy), ch
 
     def typing_ops(self):
         t = self.entry
-        desc, box, hs, cx, h = self.typing_geometry()
+        desc, box, hs, (cx, cy), h = self.typing_geometry()
         ops = [("rect", *box, None, "#000000", 1, None),
                ("rect", *box, None, "#ffffff", 1, (3, 3)),
                ("text", t["x"], t["y"], t["text"], desc, t["color"], "nw"),
                ("rect", box[2] - hs, box[3] - hs, box[2] + hs, box[3] + hs,
                 "#ffffff", "#1a1a1a", 1, None)]
         if t["caret_on"]:
-            ops.append(("line", [(cx, t["y"]), (cx, t["y"] + h)], t["color"],
+            ops.append(("line", [(cx, cy), (cx, cy + h)], t["color"],
                         max(1, t["px"] // 12), "butt", 1.0))
         return ops
 
@@ -3247,13 +3274,11 @@ class Overlay:
             return "box"
         return None
 
-    def place_caret(self, x):
-        """Put the text cursor at the character boundary nearest to x."""
+    def place_caret(self, x, y):
+        """Put the text cursor at the character boundary nearest to (x, y)."""
         t = self.entry
         desc = self.fonts.desc(t["px"], True)
-        edges = [t["x"] + self.fonts.size(t["text"][:i], desc)[0]
-                 for i in range(len(t["text"]) + 1)]
-        t["caret"] = min(range(len(edges)), key=lambda i: abs(edges[i] - x))
+        t["caret"] = self.fonts.index_at(t["text"], x - t["x"], y - t["y"], desc)
         t["caret_on"] = True
         self.redraw()
 
@@ -3283,7 +3308,7 @@ class Overlay:
         self.entry["blink"] = self.after(530, self.blink)
 
     def on_key(self, name, ch):
-        """Typing into the text box (Enter, Esc and Ctrl+ shortcuts are handled elsewhere)."""
+        """Typing into the text box (Esc and Ctrl+ shortcuts are handled elsewhere)."""
         t = self.entry
         text, i = t["text"], t["caret"]
         if name == "BackSpace":
@@ -3295,10 +3320,19 @@ class Overlay:
             i = max(0, i - 1)
         elif name == "Right":
             i = min(len(text), i + 1)
-        elif name == "Home":
-            i = 0
-        elif name == "End":
-            i = len(text)
+        elif name in ("Home", "KP_Home"):         # start / end of the current line
+            i = text.rfind("\n", 0, i) + 1
+        elif name in ("End", "KP_End"):
+            j = text.find("\n", i)
+            i = len(text) if j < 0 else j
+        elif name in ("Up", "Down", "KP_Up", "KP_Down"):
+            desc = self.fonts.desc(t["px"], True)
+            cx, cy, h = self.fonts.caret(text, i, desc)
+            down = name.endswith("Down")
+            if (down and text.find("\n", i) >= 0) or (not down and text.rfind("\n", 0, i) >= 0):
+                i = self.fonts.index_at(text, cx, cy + (h * 1.5 if down else -h / 2), desc)
+        elif name == "Return":
+            text, i = text[:i] + "\n" + text[i:], i + 1
         elif ch and ch.isprintable():
             text, i = text[:i] + ch + text[i:], i + 1
         else:
@@ -4661,8 +4695,8 @@ class Preferences:
         # Keyboard
         pg = self.page("keys", "Keyboard",
                        "Shortcuts while a screenshot is open. Click one, then press the new "
-                       "keys. Backspace turns it off, Esc cancels. Enter always copies and "
-                       "Esc always backs out.")
+                       "keys. Backspace turns it off, Esc cancels. Enter always copies (while "
+                       "typing it starts a new line) and Esc always backs out.")
         g = self.group(pg)
         self.key_btns = {}
         for action, title in KEY_ACTIONS:

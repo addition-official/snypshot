@@ -36,6 +36,7 @@ Download the new `snypshot.py` and run `python3 snypshot.py --setup` again. Your
 | Mouse wheel | Down = bigger, up = smaller (brush or text size) |
 | Hold **Shift** while drawing | Straight 45-degree lines, square boxes |
 | **Ctrl+C** or **Enter** | Copy to clipboard and close |
+| **Enter** while typing text | New line (**Ctrl+Enter** or a click outside finishes the text) |
 | **Ctrl+S** | Save instantly as `Screenshot_N.png` in the last folder you used |
 | **Ctrl+Shift+S** or the Save button | Save with a file dialog |
 | **Ctrl+P** or the Print button | Print it (or print to a PDF file) |
