@@ -3,6 +3,8 @@
 ## Unreleased
 
 **Changed**
+- Right-click no longer throws the screenshot away (it was too easy to hit by accident). Esc still cancels.
+- Like Lightshot, dragging the box past the edge of the screen now cuts it off instead of stopping it. Drag it back before letting go and it's whole again. Between two monitors it still moves across.
 - If the editor ever fails to open after a screenshot, you no longer lose the screenshot: the full screen is saved where Ctrl+S saves and copied to the clipboard, and a notification tells you where it went.
 
 **Fixed**

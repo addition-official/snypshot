@@ -42,7 +42,6 @@ Download the new `snypshot.py` and run `python3 snypshot.py --setup` again. Your
 | **Ctrl+P** or the Print button | Print it (or print to a PDF file) |
 | **Ctrl+Z** / **Ctrl+Y** | Undo / redo |
 | **Esc** | Put the tool down; press again to cancel |
-| Right-click | Cancel |
 
 You can draw outside the selection too, and it shows up if you make the selection bigger. Click placed text to edit it. The color picker is a compact palette: click a color and you're drawing with it. **+** saves a new color of your own, and **Fine-tune** opens a color square and hex box next to the palette, where clicking one of your colors lets you edit it in place. Prefer the Windows/Lightshot-style dialog? Turn on **Classic color window** in Preferences.
 

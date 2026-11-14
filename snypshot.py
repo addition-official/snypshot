@@ -26,7 +26,7 @@ Install (GNOME or KDE Plasma on Wayland, tested on Ubuntu 24.04 and 26.04):
   Ctrl+S                save to a file
   Ctrl+P                print (or print to PDF)
   Ctrl+Z / Ctrl+Y       undo / redo
-  Esc / right-click     cancel
+  Esc                   put the tool down, then cancel
 
 Privacy: on GNOME Wayland the screen is read only by a small helper inside GNOME Shell,
 which hands screenshots solely to the root-installed snypshot it started itself, over a
@@ -2030,9 +2030,6 @@ class Overlay:
             drag.set_button(1)
             hook(area, drag, ("drag-begin", self._drag_begin, area),
                  ("drag-update", self._drag_update, area), ("drag-end", self._drag_end, area))
-            rclick = Gtk.GestureClick()
-            rclick.set_button(3)
-            hook(area, rclick, ("pressed", self._right_click))
             motion = Gtk.EventControllerMotion()
             hook(area, motion, ("motion", self._motion, area), ("enter", self._motion, area))
             scroll = Gtk.EventControllerScroll.new(
@@ -2227,9 +2224,6 @@ class Overlay:
         self.hidden = True
         for win in self.wins:
             win.set_visible(False)
-
-    def _right_click(self, *_):
-        self.close()
 
     def close(self):
         if self.closed:
@@ -2429,9 +2423,10 @@ class Overlay:
         if d[0] == "new":
             self.set_sel(*d[1], x, y)
         elif d[0] == "move":
+            # Like Lightshot, the screen edge cuts off whatever goes past it. The box
+            # keeps its full size until you let go, so dragging back brings it back.
             (sx, sy), (x0, y0, x1, y1) = d[1], d[2]
-            dx = max(-x0, min(x - sx, self.sw - x1))
-            dy = max(-y0, min(y - sy, self.sh - y1))
+            dx, dy = x - sx, y - sy
             self.set_sel(x0 + dx, y0 + dy, x1 + dx, y1 + dy)
         elif d[0] == "resize":
             h, (x0, y0, x1, y1) = d[1], d[2]
@@ -2516,6 +2511,10 @@ class Overlay:
             x0, y0, x1, y1 = self.sel
             if x1 - x0 < 1 or y1 - y0 < 1:
                 self.sel = d[2]                   # squashed flat: put it back
+        elif d[0] == "move":
+            x0, y0, x1, y1 = self.sel
+            if x1 - x0 < 4 or y1 - y0 < 4:
+                self.sel = d[2]                   # pushed almost all the way off: put it back
         elif d[0] == "draw" and self.cur:
             a, self.cur = self.cur, None
             if not (a["type"] in ("line", "arrow", "rect") and len(a["pts"]) < 2):
