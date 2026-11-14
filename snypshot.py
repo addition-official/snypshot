@@ -1686,10 +1686,15 @@ def sv_square(h, size):
 
 
 def hue_strip(w, size):
-    im = Image.new("RGB", (1, size))
+    # Built row by row instead of resizing a 1-pixel column: some Pillow builds
+    # fail that resize ("returned NULL without setting an exception"), which
+    # stopped the editor from opening at all.
+    w, size = max(1, int(w)), max(1, int(size))
+    rows = bytearray()
     for y in range(size):
-        im.putpixel((0, y), tuple(int(v * 255) for v in colorsys.hsv_to_rgb(y / size, 1, 1)))
-    return im.resize((w, size), Image.NEAREST)
+        px = bytes(int(v * 255) for v in colorsys.hsv_to_rgb(y / size, 1, 1))
+        rows += px * w
+    return Image.frombytes("RGB", (w, size), bytes(rows))
 
 
 # ---------------------------------------------------------------- GTK4 overlay

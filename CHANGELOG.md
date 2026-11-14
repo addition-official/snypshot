@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+**Fixed**
+- The editor could fail to open after taking a screenshot ("returned NULL without setting an exception" in the log), so no screenshot could be taken. The color picker's hue bar is now drawn without the Pillow call that failed.
+
 ## 1.1.2
 
 **Changed**
