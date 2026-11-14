@@ -384,6 +384,7 @@ import shutil
 import signal
 import subprocess
 import time
+import traceback
 
 from PIL import Image, ImageColor, ImageDraw
 
@@ -1581,6 +1582,84 @@ def next_file_name(folder, cfg):
     while taken(f"{prefix}{n}"):
         n += 1
     return f"{prefix}{n}.{ext}"
+
+
+def flatten_capture(capture):
+    """A capture (one image, or [(rect, image), ...] per monitor) as one image. Only
+    pastes, no scaling, so it keeps working when the rest of the editor doesn't."""
+    if isinstance(capture, Image.Image):
+        return capture
+    if len(capture) == 1:
+        return capture[0][1]
+    s = max(img.width / max(1, w) for (x, y, w, h), img in capture)
+    ox = min(r[0] for r, _ in capture)
+    oy = min(r[1] for r, _ in capture)
+    spots = [(round((x - ox) * s), round((y - oy) * s), img) for (x, y, w, h), img in capture]
+    out = Image.new("RGB", (max(px + img.width for px, py, img in spots),
+                            max(py + img.height for px, py, img in spots)))
+    for px, py, img in spots:
+        out.paste(img.convert("RGB"), (px, py))
+    return out
+
+
+def rescue_capture(capture):
+    """The editor couldn't open: don't lose the screenshot. Save the whole screen where
+    Ctrl+S would, and copy it, each on its own so one failing doesn't stop the other.
+    Returns a short message saying what was kept."""
+    try:
+        img = flatten_capture(capture)
+    except Exception:
+        log("rescue: couldn't combine monitors:\n" + traceback.format_exc())
+        shots = capture if isinstance(capture, list) else [(None, capture)]
+        img = max((im for _, im in shots), key=lambda im: im.width * im.height)
+    try:
+        cfg = load_config()
+    except Exception:
+        cfg = dict(DEFAULTS)
+    saved = copied = False
+    try:
+        first = cfg.get("save_dir") if cfg.get("save_mode") == "fixed" else None
+        folder = next((d for d in (first, cfg.get("last_dir"), os.path.expanduser("~/Pictures"))
+                       if d and os.path.isdir(d)), os.path.expanduser("~"))
+        for _ in range(20):
+            path = os.path.join(folder, next_file_name(folder, cfg))
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o644 & ~current_umask())
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise OSError("no free file name")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                if path.lower().endswith((".jpg", ".jpeg")):
+                    img.convert("RGB").save(f, "JPEG", quality=cfg.get("jpg_quality", 95))
+                else:
+                    img.save(f, "PNG")
+        except BaseException:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
+        saved = path
+        log(f"rescue: saved the screenshot to {path}")
+    except Exception:
+        log("rescue: couldn't save:\n" + traceback.format_exc())
+    try:
+        copied = copy_png(img)
+    except Exception:
+        log("rescue: couldn't copy:\n" + traceback.format_exc())
+    if saved and copied:
+        kept = f"saved to {saved} and copied"
+    elif saved:
+        kept = f"saved to {saved}"
+    elif copied:
+        kept = "copied to the clipboard"
+    else:
+        return "The editor couldn't open and the screenshot couldn't be kept."
+    return f"The editor couldn't open, so the full screenshot was {kept}."
 
 
 def update_config(**changes):
@@ -5592,17 +5671,22 @@ class Daemon:
         if self.busy:
             return
         self.busy = True
+        img = None
         try:
-            self.open_overlay(grab_screen())
+            img = grab_screen()
+            self.open_overlay(img)
         except SystemExit as e:                   # couldn't capture / refused
             log(str(e))
             notify(str(e).splitlines()[-1])
             self.shot = None
         except Exception:
-            import traceback
             log(traceback.format_exc())
-            notify("Something went wrong, see ~/.cache/snypshot/snypshot.log")
             self.shot = None
+            if img is not None:                   # captured, but the editor broke:
+                msg = rescue_capture(img)         # keep the screenshot anyway
+                notify(msg + " Details: ~/.cache/snypshot/snypshot.log")
+            else:
+                notify("Something went wrong, see ~/.cache/snypshot/snypshot.log")
         finally:
             self.busy = False
 

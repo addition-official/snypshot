@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+**Changed**
+- If the editor ever fails to open after a screenshot, you no longer lose the screenshot: the full screen is saved where Ctrl+S saves and copied to the clipboard, and a notification tells you where it went.
+
 **Fixed**
 - The editor could fail to open after taking a screenshot ("returned NULL without setting an exception" in the log), so no screenshot could be taken. The color picker's hue bar is now drawn without the Pillow call that failed.
 
