@@ -15,7 +15,7 @@ python3 snypshot.py --setup
 
 (No `wget`? `curl -fLO` with the same link works too.)
 
-Nothing gets piped into a shell. It's one readable Python file, so you can look through it before you run it. Setup asks for your password once, to install the program for all users.
+Nothing gets piped into bash. Plus it's one readable Python file, so you can look through it before you run it. Setup asks for your password once, to install the program for all users.
 
 On **KDE Plasma**, that's it: press **Print Screen**. On **GNOME**, **log out and back in once** first.
 
