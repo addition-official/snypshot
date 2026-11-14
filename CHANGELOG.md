@@ -3,11 +3,13 @@
 ## Unreleased
 
 **Changed**
+- KDE: Alt+Tab and other desktop shortcuts don't switch away from a screenshot while it's open.
 - Right-click no longer throws the screenshot away (it was too easy to hit by accident). Esc still cancels.
 - Like Lightshot, dragging the box past the edge of the screen now eats the part that goes past it, and dragging back doesn't bring it back. Between two monitors it still moves across.
 - If the editor ever fails to open after a screenshot, you no longer lose the screenshot: the full screen is saved where Ctrl+S saves and copied to the clipboard, and a notification tells you where it went.
 
 **Fixed**
+- The screenshot no longer shows up in the taskbar with a generic Wayland icon; it uses snypshot's icon.
 - The editor could fail to open after taking a screenshot ("returned NULL without setting an exception" in the log), so no screenshot could be taken. The color picker's hue bar is now drawn without the Pillow call that failed.
 
 ## 1.1.2

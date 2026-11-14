@@ -1832,6 +1832,10 @@ def init_gtk():
                 self.overlay.snapshot(self, snap)
 
     Canvas = _Canvas
+    # Our Wayland app id. Without one the taskbar can't tell which app this is and
+    # shows a generic Wayland icon; "snypshot" matches the app menu entry setup makes.
+    GLib.set_prgname("snypshot")
+    GLib.set_application_name("snypshot")
     if not Gtk.init_check():
         sys.exit("snypshot: can't open the display")
     disp = Gdk.Display.get_default()
@@ -2044,6 +2048,7 @@ class Overlay:
             self.key_ctls.append((keys, win, im, im.connect("commit", self._im_commit)))
 
             win.fullscreen_on_monitor(gm)
+            win.connect("map", self._block_shortcuts)
             self.wins.append(win)
             self.areas.append(area)
         self.root = self.wins[0]
@@ -2054,6 +2059,19 @@ class Overlay:
 
     def S(self, v):
         return max(1, round(v * self.k))
+
+    @staticmethod
+    def _block_shortcuts(win):
+        """Like Lightshot: while the screenshot is up, Alt+Tab and other desktop
+        shortcuts don't take you away from it. KDE allows this right away; GNOME would
+        pop up a permission question every time, so it's KDE only. (Again on every
+        show, since hiding for a save dialog drops it.)"""
+        if not is_kde():
+            return
+        try:
+            win.get_surface().inhibit_system_shortcuts(None)
+        except Exception as e:
+            log(f"couldn't block desktop shortcuts: {e}")
 
     # --- GLib timer helpers (stand-ins for Tk's after / after_cancel)
 
