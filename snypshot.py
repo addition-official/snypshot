@@ -2423,11 +2423,19 @@ class Overlay:
         if d[0] == "new":
             self.set_sel(*d[1], x, y)
         elif d[0] == "move":
-            # Like Lightshot, the screen edge cuts off whatever goes past it. The box
-            # keeps its full size until you let go, so dragging back brings it back.
-            (sx, sy), (x0, y0, x1, y1) = d[1], d[2]
-            dx, dy = x - sx, y - sy
-            self.set_sel(x0 + dx, y0 + dy, x1 + dx, y1 + dy)
+            # Like Lightshot, the screen edge eats whatever goes past it, for good:
+            # dragging back moves the smaller box, it doesn't grow back. (Moves step
+            # by step from the current box, so the eaten part is really gone.)
+            (lx, ly), (x0, y0, x1, y1) = d[1], self.sel
+            dx, dy = x - lx, y - ly
+            nx0, nx1 = max(0, x0 + dx), min(self.sw, x1 + dx)
+            ny0, ny1 = max(0, y0 + dy), min(self.sh, y1 + dy)
+            if nx1 - nx0 < 4:                     # never eat it down to nothing
+                nx0, nx1 = x0, x1
+            if ny1 - ny0 < 4:
+                ny0, ny1 = y0, y1
+            self.set_sel(nx0, ny0, nx1, ny1)
+            self.drag = ("move", (x, y), d[2])
         elif d[0] == "resize":
             h, (x0, y0, x1, y1) = d[1], d[2]
             if "n" in h: y0 = y
@@ -2511,10 +2519,6 @@ class Overlay:
             x0, y0, x1, y1 = self.sel
             if x1 - x0 < 1 or y1 - y0 < 1:
                 self.sel = d[2]                   # squashed flat: put it back
-        elif d[0] == "move":
-            x0, y0, x1, y1 = self.sel
-            if x1 - x0 < 4 or y1 - y0 < 4:
-                self.sel = d[2]                   # pushed almost all the way off: put it back
         elif d[0] == "draw" and self.cur:
             a, self.cur = self.cur, None
             if not (a["type"] in ("line", "arrow", "rect") and len(a["pts"]) < 2):
