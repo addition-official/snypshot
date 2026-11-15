@@ -973,6 +973,7 @@ class HelperChannel:
         self.inp = os.fdopen(os.dup(0), "rb")
         self.out = os.fdopen(os.dup(1), "wb", buffering=0)
         devnull = os.open(os.devnull, os.O_RDWR)
+        rotate_log()
         logfd = log_fd()
         os.dup2(devnull, 0)
         os.dup2(logfd, 1)
@@ -5665,6 +5666,19 @@ def log_fd():
     return fd
 
 
+def rotate_log():
+    """Called when a daemon starts, before it hands the log out as stdout/stderr: if the
+    log has grown past 1 MB, move it to snypshot.log.old (replacing the previous one), so
+    warnings piling up over months can't fill your disk."""
+    import stat
+    try:
+        st = os.lstat(LOG)                        # lstat/rename: never follows a symlink
+        if stat.S_ISREG(st.st_mode) and st.st_size > 1 << 20:
+            os.replace(LOG, LOG + ".old")         # keeps its 0600; log_fd makes a new one
+    except OSError:
+        pass
+
+
 def log(msg):
     try:
         with os.fdopen(log_fd(), "a") as f:
@@ -6316,17 +6330,22 @@ def apply_hotkey(accel, take=False):
     gset("set", k, "name", "'snypshot'")
     gset("set", k, "command", f"'{SCRIPT}'")
     gset("set", k, "binding", f"'{accel}'")
-    for key in SHELL_SHOT_KEYS:                    # GNOME's own screenshot keys step aside
+    shell_keys_step_aside(accel)
+    update_config(hotkey=accel or "")
+    return None
+
+
+def shell_keys_step_aside(accel):
+    """GNOME's own screenshot keys give up accel. One that an earlier snypshot key left
+    empty (Print, Shift+Print, Alt+Print) gets its default back first, so moving
+    snypshot to another key returns the old one to GNOME."""
+    for key in SHELL_SHOT_KEYS:
+        if not gsettings_list(SHELL_KEYS, key):
+            gset("reset", SHELL_KEYS, key)
         cur = gsettings_list(SHELL_KEYS, key)
         keep = [x for x in cur if norm_accel(x) != norm_accel(accel)]
         if keep != cur:
             gset("set", SHELL_KEYS, key, str(keep))
-    if norm_accel(accel) != "print" and not gsettings_list(SHELL_KEYS, "show-screenshot-ui"):
-        gset("reset", SHELL_KEYS, "show-screenshot-ui")   # Print back to GNOME's tool
-        if norm_accel(accel) in map(norm_accel, gsettings_list(SHELL_KEYS, "show-screenshot-ui")):
-            gset("set", SHELL_KEYS, "show-screenshot-ui", "[]")
-    update_config(hotkey=accel or "")
-    return None
 
 
 SUSPENDED = os.path.join(xdg("XDG_CACHE_HOME", "~/.cache"),
@@ -6371,10 +6390,22 @@ def suspend_hotkeys():
                  "shell": {k: gsettings_list(SHELL_KEYS, k) for k in SHELL_SHOT_KEYS}}
     except RuntimeError:
         return                                    # can't remember them: don't touch them
+    if not (restorable(saved["ours"])
+            and all(restorable(x) for v in saved["shell"].values() for x in v)):
+        return                                    # couldn't put them back: don't touch them
     cache_dir()
-    fd = os.open(SUSPENDED, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(saved, f)
+    try:
+        fd = os.open(SUSPENDED, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(saved, f)
+            f.flush()
+            os.fsync(f.fileno())                  # on disk before the keys go blank
+    except OSError:                               # e.g. disk full: don't leave half a file
+        try:
+            os.remove(SUSPENDED)
+        except OSError:
+            pass
+        return
     gset("set", f"{MEDIA_KEYS}.custom-keybinding:{KEY_PATH}", "binding", "''")
     for k in SHELL_SHOT_KEYS:
         gset("set", SHELL_KEYS, k, "[]")
@@ -6398,22 +6429,47 @@ def resume_hotkeys():
     resume_gnome_hotkeys()
 
 
+def restorable(v):
+    """A key suspend_hotkeys can write back safely: "" or a plain accelerator."""
+    return isinstance(v, str) and (v == "" or bool(ACCEL_RE.fullmatch(v)))
+
+
 def resume_gnome_hotkeys():
     try:
-        with open(SUSPENDED) as f:
-            saved = json.load(f)
-        os.remove(SUSPENDED)
-    except (OSError, ValueError):
+        with open(SUSPENDED, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return                                    # nothing was suspended
+    except OSError:
+        raw = b""
+    try:
+        os.remove(SUSPENDED)                      # always, or picking a key never suspends again
+    except OSError:
+        pass
+    try:
+        saved = json.loads(raw)
+    except ValueError:
+        saved = None
+    if not isinstance(saved, dict):
+        # Unreadable (e.g. cut short by a crash while you picked a key), so we can't
+        # know what the keys were. Rather than leave Print Screen dead: GNOME's keys
+        # get their defaults back and snypshot gets the key you chose.
+        try:
+            for k in SHELL_SHOT_KEYS:
+                gset("reset", SHELL_KEYS, k)
+            hotkey = load_config()["hotkey"]
+            gset("set", f"{MEDIA_KEYS}.custom-keybinding:{KEY_PATH}", "binding", f"'{hotkey}'")
+            shell_keys_step_aside(hotkey)
+        except (RuntimeError, OSError):           # (OSError: no gsettings here)
+            pass
         return
-    ok = lambda v: isinstance(v, str) and (v == "" or ACCEL_RE.fullmatch(v))
-    if isinstance(saved, dict):
-        if ok(saved.get("ours")):
-            gset("set", f"{MEDIA_KEYS}.custom-keybinding:{KEY_PATH}", "binding", f"'{saved['ours']}'")
-        shell = saved.get("shell") if isinstance(saved.get("shell"), dict) else {}
-        for k in SHELL_SHOT_KEYS:
-            v = shell.get(k)
-            if isinstance(v, list) and all(ok(x) for x in v):
-                gset("set", SHELL_KEYS, k, str(v))
+    if restorable(saved.get("ours")):
+        gset("set", f"{MEDIA_KEYS}.custom-keybinding:{KEY_PATH}", "binding", f"'{saved['ours']}'")
+    shell = saved.get("shell") if isinstance(saved.get("shell"), dict) else {}
+    for k in SHELL_SHOT_KEYS:
+        v = shell.get(k)
+        if isinstance(v, list) and all(restorable(x) for x in v):
+            gset("set", SHELL_KEYS, k, str(v))
 
 
 def bind_key(key=None):
@@ -6785,6 +6841,7 @@ def main():
                 time.sleep(0.1)
         log("the snypshot service didn't start; running it directly")
     if "--foreground" not in args:                # detach, so the terminal/shortcut returns
+        rotate_log()
         out = os.fdopen(log_fd(), "a")
         cmd = [daemon_python(), "-I", SCRIPT, "--daemon", "--foreground"]
         if capture_now:
