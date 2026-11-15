@@ -24,7 +24,7 @@
 - On two monitors at the same fractional scaling (for example both at 150% on KDE), a screenshot across both no longer comes out slightly blurred on one of them.
 - Clicking into a placed text and leaving it unchanged no longer makes Ctrl+Z remove that text before your newer drawings, and no longer throws away what Ctrl+Y could bring back. Undoing an edit puts the text back where it was.
 - A shape drawn over a text label now covers it in the saved or copied image too, like it does on screen. Before, text always came out on top.
-- Plugging in or removing a monitor while a screenshot is open now closes it, instead of leaving a window that shows and selects the wrong part of the screen.
+- Plugging in or removing a monitor while a screenshot is open now closes it, instead of leaving a window that shows and selects the wrong part of the screen. Your work is kept first: the selection with your drawings (or the whole screenshot if nothing is selected) is saved and copied the same way as when the editor can't open, and a notification says so. While the Save or Print window is open the screenshot is left alone, so the save or print still goes ahead; it only closes this way if you cancel and it would come back.
 - No more GTK warning in the log when there's no keyboard or mouse seat (for example in a headless session) on KDE.
 - Printing to label printers (for example a Dymo) no longer fails with "invalid matrix", and on small labels the screenshot is no longer squeezed into a sliver by page-sized margins. The page is now the real label size.
 - Paper sizes with a decimal point in the name (like "3.5x5" on driverless photo printers) are now laid out on that paper instead of on A4 or Letter.

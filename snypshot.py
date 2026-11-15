@@ -1670,10 +1670,10 @@ def flatten_capture(capture):
     return out
 
 
-def rescue_capture(capture):
-    """The editor couldn't open: don't lose the screenshot. Save the whole screen where
-    Ctrl+S would, and copy it, each on its own so one failing doesn't stop the other.
-    Returns a short message saying what was kept."""
+def rescue_capture(capture, why="The editor couldn't open", what="full screenshot"):
+    """The editor couldn't open (or had to close): don't lose the screenshot. Save the
+    image where Ctrl+S would, and copy it, each on its own so one failing doesn't stop
+    the other. Returns a short message saying what was kept, starting with why."""
     try:
         img = flatten_capture(capture)
     except Exception:
@@ -1726,8 +1726,8 @@ def rescue_capture(capture):
     elif copied:
         kept = "copied to the clipboard"
     else:
-        return "The editor couldn't open and the screenshot couldn't be kept."
-    return f"The editor couldn't open, so the full screenshot was {kept}."
+        return f"{why} and the screenshot couldn't be kept."
+    return f"{why}, so the {what} was {kept}."
 
 
 def update_config(**changes):
@@ -2078,6 +2078,7 @@ class Overlay:
         self.dialog_open = False
         self.dialog_win = None
         self.hidden = False
+        self.monitors_stale = False               # monitors changed while hidden
 
         # One fullscreen window per monitor, fully drawn before it appears.
         self.wins, self.areas = [], []
@@ -2133,10 +2134,39 @@ class Overlay:
             self._monitors_changed))
 
     def _monitors_changed(self):
-        if not self.closed:
-            log("monitors changed; closing the screenshot")
-            self.close()
+        if self.closed:
+            return False
+        if self.hidden or self.dialog_open:
+            # Hidden for a Save or Print dialog: closing now would cancel the dialog and
+            # lose the work, and the windows don't matter while hidden. Deal with it if
+            # the screenshot comes back instead (back_from_dialog).
+            log("monitors changed while hidden; closing later if it comes back")
+            self.monitors_stale = True
+            return False
+        self._close_for_monitors()
         return False
+
+    def _close_for_monitors(self):
+        """The monitors changed: keep the work (the selection with its drawings, else
+        the whole capture), say what was kept, then close."""
+        log("monitors changed; keeping the screenshot and closing it")
+        img, what = None, "full screenshot"
+        if self.sel:
+            try:
+                if self.entry:
+                    self.commit_text()            # keep what you were typing too
+                img, what = self.render(), "selection with your drawings"
+            except Exception:
+                log("couldn't render the selection:\n" + traceback.format_exc())
+                img, what = None, "full screenshot"
+        if img is None:
+            img = [(p["rect"], p["img"]) for p in self.parts]
+        try:
+            notify(rescue_capture(img, "The screenshot closed because the monitors "
+                                       "changed", what))
+        except Exception:
+            log("rescue failed:\n" + traceback.format_exc())
+        self.close()
 
     def S(self, v):
         return max(1, round(v * self.k))
@@ -4228,6 +4258,9 @@ class Overlay:
         GLib.timeout_add(120, show)
 
     def back_from_dialog(self):
+        if self.monitors_stale:                   # the monitors changed meanwhile: the
+            self._close_for_monitors()            # windows no longer fit the screens
+            return
         self.take_focus()
         self.set_cursor("crosshair")
         self.render_ui()
