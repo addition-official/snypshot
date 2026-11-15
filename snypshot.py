@@ -4215,9 +4215,9 @@ class Overlay:
         GLib.timeout_add(120, show)
 
     def print_dialog(self):
-        """The Print button: snypshot's own simple print window (like Chrome's: a preview,
-        where to print, copies, layout, color). Like saving, the screenshot steps aside
-        meanwhile and Cancel brings it back."""
+        """The Print button: your desktop's own print dialog (KDE's on Plasma), or
+        snypshot's own print window where there's none. Like saving, the screenshot steps
+        aside meanwhile and Cancel brings it back."""
         if self.closed or not self.sel or self.drag or self.dialog_open:
             return
         if self.entry:
@@ -4240,7 +4240,34 @@ class Overlay:
                 return
             self.close() if done else self.back_from_dialog()
 
+        def portal_ended(job, result):
+            if self.dialog_win is not job:
+                return
+            if result == "unavailable":           # no print portal: our own window
+                self.dialog_win = None
+                show_own()
+                return
+            self.dialog_win = None
+            self.dialog_open = False
+            if self.closed:
+                return
+            if result == "failed":
+                notify("Printing didn't work. Details: ~/.cache/snypshot/snypshot.log")
+            self.close() if result == "done" else self.back_from_dialog()
+
         def show():                                # once the screenshot is off screen
+            if self.closed or not self.dialog_open:
+                return False
+            try:
+                job = PortalPrint(img, self.out_scale(self.sel),
+                                  lambda result: portal_ended(job, result))
+                self.dialog_win = job
+            except Exception:
+                log("print portal helper failed:\n" + traceback.format_exc())
+                show_own()
+            return False
+
+        def show_own():
             if self.closed or not self.dialog_open:
                 return False
             try:
@@ -4318,6 +4345,237 @@ def draw_page(cr, pw, ph, img, landscape, fit, gray, unit=1.0):
     cr.paint()
     cr.restore()
 
+
+# The desktop's own print dialog (KDE's on Plasma, GTK's on GNOME), through the print
+# portal. snypshot itself is non-dumpable (see no_dumps), and the portal refuses any
+# process it can't look up in /proc, so a small separate helper process asks for the
+# dialog: it gets the dialog's choices, snypshot draws a PDF for that paper, and the
+# helper hands the PDF over. If there's no portal, snypshot's own print window is used.
+
+PORTAL_PDF_MAX = 512 << 20
+
+
+def run_print_portal():
+    """--print-portal: the helper (a child of snypshot, talking JSON lines over a pipe).
+    Says {"event": "prepared", ...} with the dialog's choices, then reads the PDF
+    ("<size>\\n" + bytes) from stdin and says "done", "cancelled", "failed" or
+    "unavailable" (no print portal here: use snypshot's own window)."""
+    import secrets
+    from gi.repository import Gio, GLib
+
+    out = sys.stdout
+
+    def say(event, **kw):
+        out.write(json.dumps({"event": event, **kw}, default=str) + "\n")
+        out.flush()
+
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    except Exception as e:
+        say("unavailable", msg=str(e))
+        return
+    sender = bus.get_unique_name()[1:].replace(".", "_")
+    title = "snypshot screenshot"
+    loop = GLib.MainLoop()
+    state = {"handle": None, "result": None}
+
+    def ask(method, params, fds=None):
+        """Call a print portal method and wait for its answer (code, results)."""
+        token = "snypshot" + secrets.token_hex(8)
+        handle = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+        state["handle"], state["result"] = handle, None
+
+        def answered(_c, _s, _p, _i, _sig, data):
+            state["result"] = data.unpack()
+            loop.quit()
+        sub = bus.signal_subscribe("org.freedesktop.portal.Desktop",
+                                   "org.freedesktop.portal.Request", "Response", handle,
+                                   None, Gio.DBusSignalFlags.NO_MATCH_RULE, answered)
+        opts = dict(params.pop("opts"))
+        opts["handle_token"] = GLib.Variant("s", token)
+        args = GLib.Variant(params["sig"], (*params["args"], opts))
+        try:
+            if fds is not None:
+                bus.call_with_unix_fd_list_sync(
+                    "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+                    "org.freedesktop.portal.Print", method, args, GLib.VariantType("(o)"),
+                    Gio.DBusCallFlags.NONE, 30000, fds, None)
+            else:
+                bus.call_sync("org.freedesktop.portal.Desktop",
+                              "/org/freedesktop/portal/desktop",
+                              "org.freedesktop.portal.Print", method, args,
+                              GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, 30000, None)
+            loop.run()                            # until the answer (or snypshot gives up)
+        finally:
+            bus.signal_unsubscribe(sub)
+        return state["result"]
+
+    def stop(*_):                                 # snypshot closed our stdin: give up
+        h = state["handle"]
+        if h and state["result"] is None:
+            try:
+                bus.call_sync("org.freedesktop.portal.Desktop", h,
+                              "org.freedesktop.portal.Request", "Close", None, None,
+                              Gio.DBusCallFlags.NONE, 2000, None)
+            except Exception:
+                pass
+        os._exit(0)
+
+    # One thread reads everything snypshot sends: the PDF size and bytes. If snypshot
+    # closes the pipe instead (cancelled, or gone), any open dialog is closed.
+    import threading
+    stdin = sys.stdin.buffer
+    got = {"data": None}
+    have_pdf = threading.Event()
+
+    def reader():
+        line = stdin.readline().strip()
+        if line.isdigit() and 0 < int(line) <= PORTAL_PDF_MAX:
+            data = stdin.read(int(line))
+            if len(data) == int(line):
+                got["data"] = data
+        have_pdf.set()
+        if got["data"] is None:
+            GLib.idle_add(stop)
+    threading.Thread(target=reader, daemon=True).start()
+
+    try:
+        res = ask("PreparePrint", {"sig": "(ssa{sv}a{sv}a{sv})",
+                                   "args": ("", title, {}, {}),
+                                   "opts": {"modal": GLib.Variant("b", True)}})
+    except Exception as e:
+        say("unavailable", msg=str(e))
+        return
+    if not res or res[0] != 0:
+        say("cancelled")
+        return
+    results = res[1]
+    say("prepared", page=results.get("page-setup", {}))
+    have_pdf.wait()
+    data = got["data"]
+    if data is None:
+        return                                    # snypshot changed its mind
+    fd = os.memfd_create("snypshot-print", os.MFD_CLOEXEC)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.lseek(fd, 0, os.SEEK_SET)
+        fds = Gio.UnixFDList.new()
+        idx = fds.append(fd)
+        opts = {}
+        if "token" in results:
+            opts["token"] = GLib.Variant("u", int(results["token"]))
+        res = ask("Print", {"sig": "(ssha{sv})", "args": ("", title, idx), "opts": opts}, fds)
+    except Exception as e:
+        say("failed", msg=str(e))
+        return
+    finally:
+        os.close(fd)
+    say("done" if res and res[0] == 0 else "cancelled" if res and res[0] == 1 else "failed")
+
+
+def portal_page(page):
+    """(width, height, landscape) in points from the portal's page setup (mm, upright
+    paper). None if it didn't say: snypshot then uses A4."""
+    try:
+        w, h = float(page["Width"]), float(page["Height"])
+        if not (10 <= w <= 2000 and 10 <= h <= 2000):
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+    pw, ph = w * 72 / 25.4, h * 72 / 25.4
+    landscape = "landscape" in str(page.get("Orientation", ""))
+    return min(pw, ph), max(pw, ph), landscape
+
+
+def page_pdf(img, page, unit):
+    """The screenshot laid out on the chosen paper, as PDF bytes (never touches disk)."""
+    import cairo as C
+    pw, ph, landscape = portal_page(page) or (595.28, 841.89, img.width > img.height)
+    buf = io.BytesIO()
+    surf = C.PDFSurface(buf, pw, ph)
+    cr = C.Context(surf)
+    draw_page(cr, pw, ph, img, landscape, False, False, unit)
+    cr.show_page()
+    surf.finish()
+    return buf.getvalue()
+
+
+class PortalPrint:
+    """One print through the desktop's dialog. on_end(result): "done", "cancelled",
+    "failed" or "unavailable". Stands in for a dialog window: present() and
+    response() cancel it (Print Screen while it's up brings the screenshot back)."""
+
+    def __init__(self, img, unit, on_end):
+        import threading
+        self.img, self.unit, self.on_end = img, unit, on_end
+        self.ended = self.prepared = False
+        with os.fdopen(log_fd(), "a") as err:
+            self.proc = subprocess.Popen(
+                [sys.executable, "-I", SCRIPT, "--print-portal"], stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=err, env=clean_env())
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        for raw in self.proc.stdout:
+            try:
+                msg = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(msg, dict):
+                GLib.idle_add(self._got, msg)
+        self.proc.wait()                          # (no zombie left behind)
+        GLib.idle_add(self._got, {"event": "gone"})
+
+    def _got(self, msg):
+        if self.ended:
+            return False
+        ev = msg.get("event")
+        if ev == "prepared":
+            self.prepared = True
+            try:
+                pdf = page_pdf(self.img, msg.get("page") or {}, self.unit)
+                self.proc.stdin.write(f"{len(pdf)}\n".encode() + pdf)
+                self.proc.stdin.flush()
+            except Exception:
+                log("print: couldn't hand over the page:\n" + traceback.format_exc())
+                self._end("failed")
+        elif ev in ("done", "cancelled", "failed", "unavailable"):
+            if msg.get("msg"):
+                log(f"print portal: {ev}: {msg['msg']}")
+            self._end(ev)
+        elif ev == "gone":                        # the helper died: before the dialog
+            self._end("failed" if self.prepared else "unavailable")   # means no portal
+        return False
+
+    def _end(self, result):
+        if self.ended:
+            return
+        self.ended = True
+        log(f"print: {result}")
+        try:
+            self.proc.stdin.close()               # (tells the helper to give up, if waiting)
+        except Exception:
+            pass
+        self.on_end(result)
+
+    def cancel(self):
+        if not self.ended:
+            try:
+                self.proc.stdin.close()           # the helper closes the dialog and exits
+            except Exception:
+                pass
+            self._end("cancelled")
+
+    def present(self):
+        self.cancel()
+
+    def response(self, *_):
+        self.cancel()
+
+    def destroy(self):
+        pass
 
 def printer_list():
     """(printer names, default name) from CUPS, the Linux print system."""
@@ -6657,7 +6915,8 @@ def replace_old_daemon():
 FLAGS = {"--setup", "--install", "--uninstall", "--preferences", "--doctor", "--test-capture",
          "--quit", "--once", "--daemon", "--foreground", "--capture", "--helper", "--service",
          "--tray", "--version", "--allow-portal", "--disallow-portal", "--bind-key",
-         "--unbind-key", "--install-extension", "--from-setup", "--help", "-h"}
+         "--unbind-key", "--install-extension", "--from-setup", "--print-portal", "--help",
+         "-h"}
 
 
 def main():
@@ -6669,6 +6928,9 @@ def main():
            and not (i and args[i - 1] == "--tray")]
     if odd:
         sys.exit(f"snypshot: unknown option {odd[0]!r} (see snypshot --help)")
+    if "--print-portal" in args:                  # the print dialog helper (see PortalPrint)
+        run_print_portal()
+        return
     if os.geteuid() == 0 and "--version" not in args:
         # As root it would set up or clean up root's account, not yours, and say it worked.
         sys.exit("Run snypshot as yourself, without sudo. It asks for your password when needed.")

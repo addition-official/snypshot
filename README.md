@@ -39,7 +39,7 @@ Download the new `snypshot.py` and run `python3 snypshot.py --setup` again. Your
 | **Enter** while typing text | New line (**Ctrl+Enter** or a click outside finishes the text) |
 | **Ctrl+S** | Save instantly as `Screenshot_N.png` in the last folder you used |
 | **Ctrl+Shift+S** or the Save button | Save with a file dialog |
-| **Ctrl+P** or the Print button | Print it (or print to a PDF file) |
+| **Ctrl+P** or the Print button | Print it with your desktop's own print dialog (KDE's on Plasma) |
 | **Ctrl+Z** / **Ctrl+Y** | Undo / redo |
 | **Esc** | Put the tool down; press again to cancel |
 
@@ -80,7 +80,7 @@ KDE Plasma doesn't need that: KWin hands screenshots to apps it's told to trust,
 
 ## Privacy and security
 
-- Screenshots never touch the disk unless you save or print them (printing writes a temporary PDF in a private folder and deletes it right after). They go from GNOME Shell or KWin to snypshot over a private pipe.
+- Screenshots never touch the disk unless you save them. Printing hands the page to your desktop's print dialog in memory (snypshot's own print window, used only where there's no such dialog, writes a temporary PDF in a private folder and deletes it right after). They go from GNOME Shell or KWin to snypshot over a private pipe.
 - On GNOME, the extension only hands screenshots to the copy of snypshot it started itself, and only if that copy is installed by root, so other programs can't swap themselves in. It refuses while snypshot is being debugged.
 - On KDE, KWin trusts snypshot's own copy of Python (installed by root) to take screenshots, for every user on this computer. Like Spectacle's permission, that means programs you run could use it to take a screenshot without asking, which KDE already allows through Spectacle anyway.
 - The overlay is a native Wayland window that other apps can't read.
