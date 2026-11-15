@@ -1214,12 +1214,27 @@ def grab_portal():
         import secrets
         token = "snypshot" + secrets.token_hex(8)
         req = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
-        loop, result = GLib.MainLoop(), {}
+        loop, result, sub = GLib.MainLoop(), {}, None
 
         def on_response(conn, name, path, iface, signal, params):
             code, res = params.unpack()
+            if result.get("late"):
+                # Answered after we gave up (say the "Allow?" dialog sat there): no
+                # screenshot is wanted any more, but GNOME still saved one in ~/Pictures.
+                bus.signal_unsubscribe(sub)
+                if code == 0 and res.get("uri"):
+                    try:
+                        os.remove(unquote(urlparse(res["uri"]).path))
+                    except OSError:
+                        pass
+                return
             result["code"], result["uri"] = code, res.get("uri")
             loop.quit()
+
+        def on_timeout():
+            result["late"] = True
+            loop.quit()
+            return False
 
         sub = bus.signal_subscribe("org.freedesktop.portal.Desktop",
                                    "org.freedesktop.portal.Request", "Response", req,
@@ -1230,9 +1245,20 @@ def grab_portal():
                       "org.freedesktop.portal.Screenshot", "Screenshot",
                       GLib.Variant("(sa{sv})", ("", opts)), None,
                       Gio.DBusCallFlags.NONE, -1, None)
-        GLib.timeout_add_seconds(60, loop.quit)
+        timer = GLib.timeout_add_seconds(60, on_timeout)
         loop.run()
-        bus.signal_unsubscribe(sub)
+        if result.get("late"):
+            # Ask the portal to drop the request so it never saves anything. If its answer
+            # still comes, the handler above (left subscribed) deletes the saved copy.
+            try:
+                bus.call_sync("org.freedesktop.portal.Desktop", req,
+                              "org.freedesktop.portal.Request", "Close", None, None,
+                              Gio.DBusCallFlags.NONE, 2000, None)
+            except Exception:
+                pass
+        else:
+            GLib.source_remove(timer)
+            bus.signal_unsubscribe(sub)
         if result.get("code") != 0 or not result.get("uri"):
             log(f"portal said no (code {result.get('code')}). Use the GNOME helper "
                 "(snypshot --install-extension) or opt in with snypshot --allow-portal")
@@ -1428,7 +1454,8 @@ def grab_kwin():
 
 
 def copy_png(img):
-    """Put a PNG on the clipboard. Returns False if no clipboard tool is installed."""
+    """Put a PNG on the clipboard. Returns False if no clipboard tool is installed or
+    it failed."""
     buf = io.BytesIO()
     img.save(buf, "PNG")
     if WAYLAND:                       # X11 clipboard tools would expose it to X11 apps
@@ -1439,8 +1466,17 @@ def copy_png(img):
         cmd = [T("xclip"), "-selection", "clipboard", "-t", "image/png", "-i"]
     else:
         return False
-    subprocess.run(cmd, input=buf.getvalue(), stdout=subprocess.DEVNULL, env=clean_env(),
-                   stderr=subprocess.DEVNULL, timeout=10)
+    # stderr stays DEVNULL: wl-copy and xclip leave a child behind that keeps serving the
+    # clipboard, and a pipe it inherited would make us wait for it until the timeout.
+    try:
+        r = subprocess.run(cmd, input=buf.getvalue(), stdout=subprocess.DEVNULL,
+                           env=clean_env(), stderr=subprocess.DEVNULL, timeout=10)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log(f"{os.path.basename(cmd[0])}: {e}")
+        return False
+    if r.returncode != 0:            # e.g. it couldn't reach the display: nothing copied
+        log(f"{os.path.basename(cmd[0])} exited {r.returncode}")
+        return False
     return True
 
 
@@ -1474,6 +1510,19 @@ DEFAULTS = {
 ACCEL_RE = re.compile(r"(<(Control|Primary|Shift|Alt|Super|Meta|Hyper)>){0,4}[A-Za-z0-9_]{1,32}")
 
 
+def prefix_ok(v):
+    """A file name prefix that's safe to use. Linux allows 255 bytes per file name, and an
+    emoji takes 4: limit the bytes too, leaving room for the number or date and extension."""
+    if not isinstance(v, str):
+        return False
+    try:
+        b = v.encode("utf-8")              # also rejects lone surrogates from a hand edit
+    except UnicodeEncodeError:
+        return False
+    return (len(v) <= 64 and len(b) <= 200 and not v.startswith(".")
+            and re.fullmatch(r"[^/\\\x00-\x1f\x7f]*", v) is not None)
+
+
 def load_config():
     cfg = json.loads(json.dumps(DEFAULTS))
     try:
@@ -1481,6 +1530,16 @@ def load_config():
             data = json.load(f, parse_constant=lambda c: None)   # no NaN / Infinity
         if isinstance(data, dict):
             cfg.update(data)
+    except FileNotFoundError:
+        pass
+    except (ValueError, RecursionError):
+        # Not valid JSON (a hand edit gone wrong?): keep it aside, or the next automatic
+        # save (after every Ctrl+S) would replace all your settings with the defaults.
+        try:
+            os.replace(CONFIG, CONFIG + ".broken")
+            log(f"{CONFIG} couldn't be read, kept it as {CONFIG}.broken and using defaults")
+        except Exception:
+            pass
     except Exception:
         pass
     # Validate everything: a broken or tampered config must never crash snypshot or put
@@ -1506,8 +1565,7 @@ def load_config():
     pick("hotkey", lambda v: v == "" or accel_ok(v))      # "" = shortcut switched off
     pick("save_mode", lambda v: v in ("last", "fixed"))
     pick("name_style", lambda v: v in ("number", "date"))
-    pick("name_prefix", lambda v: isinstance(v, str) and len(v) <= 64 and not v.startswith(".")
-         and re.fullmatch(r"[^/\\\x00-\x1f\x7f]*", v) is not None)
+    pick("name_prefix", prefix_ok)
     pick("format", lambda v: v in ("png", "jpg"))
     pick("jpg_quality", lambda v: isinstance(v, int) and not isinstance(v, bool) and 50 <= v <= 100)
     pick("dim", lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= 0.9)
@@ -1585,8 +1643,9 @@ def next_file_name(folder, cfg):
 
 
 def flatten_capture(capture):
-    """A capture (one image, or [(rect, image), ...] per monitor) as one image. Only
-    pastes, no scaling, so it keeps working when the rest of the editor doesn't."""
+    """A capture (one image, or [(rect, image), ...] per monitor) as one image. Kept
+    simple (paste, plus a plain resize for a monitor captured at a lower scale than the
+    rest) so it keeps working when the rest of the editor doesn't."""
     if isinstance(capture, Image.Image):
         return capture
     if len(capture) == 1:
@@ -1594,7 +1653,12 @@ def flatten_capture(capture):
     s = max(img.width / max(1, w) for (x, y, w, h), img in capture)
     ox = min(r[0] for r, _ in capture)
     oy = min(r[1] for r, _ in capture)
-    spots = [(round((x - ox) * s), round((y - oy) * s), img) for (x, y, w, h), img in capture]
+    spots = []
+    for (x, y, w, h), img in capture:
+        # Fill the monitor's whole slot, or a lower-scale monitor leaves a black band.
+        sw, sh = max(1, round(w * s)), max(1, round(h * s))
+        im = img if img.size == (sw, sh) else img.resize((sw, sh), Image.NEAREST)
+        spots.append((round((x - ox) * s), round((y - oy) * s), im))
     out = Image.new("RGB", (max(px + img.width for px, py, img in spots),
                             max(py + img.height for px, py, img in spots)))
     for px, py, img in spots:
@@ -3863,8 +3927,9 @@ class Overlay:
             GLib.timeout_add(150, lambda: self.close() or False)   # let the offer go out
             self.let_go()
         else:
-            self.tip = ("Can't copy: install wl-clipboard (Wayland) or xclip (X11)",
-                        self.sel[0], self.sel[1])
+            msg = ("Couldn't copy to the clipboard" if have("wl-copy" if WAYLAND else "xclip")
+                   else "Can't copy: install wl-clipboard (Wayland) or xclip (X11)")
+            self.tip = (msg, self.sel[0], self.sel[1])
             self.render_ui()
 
     # --- saving
@@ -3897,7 +3962,16 @@ class Overlay:
         else:
             import tempfile
             fd, tmp = tempfile.mkstemp(dir=folder, prefix=".snypshot-")
-            os.fchmod(fd, 0o644 & ~current_umask())
+            mode = 0o644 & ~current_umask()
+            try:
+                # Replacing a file: never make it readable by more people than before
+                # (a private 0600 file stays private). lstat: a symlink's mode means nothing.
+                st = os.lstat(path)
+                if (st.st_mode & 0o170000) == 0o100000:      # a regular file
+                    mode &= st.st_mode
+            except OSError:
+                pass
+            os.fchmod(fd, mode)
         try:
             with os.fdopen(fd, "wb") as f:
                 if fmt == "JPEG":
@@ -4883,7 +4957,8 @@ class Preferences:
             update_config(name_prefix=before)
             self.cfg = load_config()
             e.add_css_class("snyp-bad")
-            self.say("File names can't contain / or \\ or start with a dot.", bad=True)
+            self.say("File names can't contain / or \\, start with a dot or be this long.",
+                     bad=True)
         else:
             e.remove_css_class("snyp-bad")
             self.say("")

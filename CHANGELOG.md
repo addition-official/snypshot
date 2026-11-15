@@ -15,6 +15,14 @@
 - `sudo snypshot` now tells you to run it as yourself. Before, `sudo snypshot --uninstall` removed nothing but said snypshot was gone.
 - `snypshot --once` also keeps the screenshot if the editor fails to open, and on KDE it uses the fast KWin capture when it can.
 - `snypshot --tray` without an icon path shows an error instead of crashing.
+- If copying fails (for example wl-copy or xclip can't reach the screen), snypshot now says so and keeps the screenshot open, instead of saying "Copied to clipboard" and closing with nothing copied.
+- A typo in `config.json` no longer wipes all your settings the next time you save: the broken file is kept as `config.json.broken` and snypshot starts from the defaults.
+- A "Names start with" prefix made of many emoji is now refused right away, instead of making every save fail with "File name too long".
+- If the editor fails to open on monitors with different scaling, the rescued full-screen image no longer has big black bands with monitors in the wrong place.
+
+**Security**
+- Saving over an existing file from the Save dialog keeps it as private as it was: a file only you could read no longer becomes readable by everyone.
+- Portal screenshots: if the "Allow screenshot?" prompt is answered after snypshot gave up waiting, the copy the desktop saved in Pictures is now deleted instead of left behind.
 
 ## 1.1.2
 
