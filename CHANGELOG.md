@@ -19,6 +19,13 @@
 - A typo in `config.json` no longer wipes all your settings the next time you save: the broken file is kept as `config.json.broken` and snypshot starts from the defaults.
 - A "Names start with" prefix made of many emoji is now refused right away, instead of making every save fail with "File name too long".
 - If the editor fails to open on monitors with different scaling, the rescued full-screen image no longer has big black bands with monitors in the wrong place.
+- With monitors that don't line up, a selection reaching into the empty space above a monitor no longer comes out cut short, with your drawings squashed and in the wrong place.
+- With monitors of different sizes, dragging the box past the edge of the smaller one now eats the part that goes past it too, instead of letting it slide into space no screen shows and saving that as black.
+- On two monitors at the same fractional scaling (for example both at 150% on KDE), a screenshot across both no longer comes out slightly blurred on one of them.
+- Clicking into a placed text and leaving it unchanged no longer makes Ctrl+Z remove that text before your newer drawings, and no longer throws away what Ctrl+Y could bring back. Undoing an edit puts the text back where it was.
+- A shape drawn over a text label now covers it in the saved or copied image too, like it does on screen. Before, text always came out on top.
+- Plugging in or removing a monitor while a screenshot is open now closes it, instead of leaving a window that shows and selects the wrong part of the screen.
+- No more GTK warning in the log when there's no keyboard or mouse seat (for example in a headless session) on KDE.
 
 **Security**
 - Saving over an existing file from the Save dialog keeps it as private as it was: a file only you could read no longer becomes readable by everyone.

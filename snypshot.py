@@ -2120,6 +2120,19 @@ class Overlay:
         for win in self.wins:
             win.present()
         self.set_cursor("crosshair")
+        # A monitor plugged in or out while this is up: the screenshot and the windows
+        # no longer match the screens (a window moved to another monitor would show and
+        # select the wrong part), so close it. (Connected last, so a failure above can't
+        # leave it behind; let go of in _teardown.)
+        self._mons = mons
+        self._mon_hid = mons.connect("items-changed", lambda *a: GLib.idle_add(
+            self._monitors_changed))
+
+    def _monitors_changed(self):
+        if not self.closed:
+            log("monitors changed; closing the screenshot")
+            self.close()
+        return False
 
     def S(self, v):
         return max(1, round(v * self.k))
@@ -2133,7 +2146,12 @@ class Overlay:
         if not is_kde():
             return
         try:
-            win.get_surface().inhibit_system_shortcuts(None)
+            # (With no seat, e.g. a headless session, GTK can't do this and logs a
+            # critical warning instead of failing quietly, so don't ask.)
+            surface = win.get_surface()
+            if surface is None or win.get_display().get_default_seat() is None:
+                return
+            surface.inhibit_system_shortcuts(None)
         except Exception as e:
             log(f"couldn't block desktop shortcuts: {e}")
 
@@ -2328,6 +2346,12 @@ class Overlay:
                 on_close()
 
     def _teardown(self):
+        if getattr(self, "_mon_hid", None):
+            try:
+                self._mons.disconnect(self._mon_hid)
+            except Exception:
+                pass
+            self._mon_hid = None
         self.cancel_dialog()
         if self.picker and self.picker.get("modern"):
             self.save_mine()                      # keep edits to your colors
@@ -2510,8 +2534,18 @@ class Overlay:
             # by step from the current box, so the eaten part is really gone.)
             (lx, ly), (x0, y0, x1, y1) = d[1], self.sel
             dx, dy = x - lx, y - ly
-            nx0, nx1 = max(0, x0 + dx), min(self.sw, x1 + dx)
-            ny0, ny1 = max(0, y0 + dy), min(self.sh, y1 + dy)
+            # The edges are those of the monitors the moved box is on, not of the
+            # rectangle around all monitors: with monitors of different sizes that
+            # rectangle has corners no monitor shows (they'd be saved as black).
+            mx0, my0, mx1, my1 = x0 + dx, y0 + dy, x1 + dx, y1 + dy
+            cols = [m for m in self.monitors if m[0] < mx1 and m[0] + m[2] > mx0] \
+                or self.monitors                  # (monitors above / below the box)
+            rows = [m for m in self.monitors if m[1] < my1 and m[1] + m[3] > my0] \
+                or self.monitors                  # (monitors left / right of it)
+            left, right = min(m[0] for m in rows), max(m[0] + m[2] for m in rows)
+            top, bottom = min(m[1] for m in cols), max(m[1] + m[3] for m in cols)
+            nx0, nx1 = max(left, mx0), min(right, mx1)
+            ny0, ny1 = max(top, my0), min(bottom, my1)
             if nx1 - nx0 < 4:                     # never eat it down to nothing
                 nx0, nx1 = x0, x1
             if ny1 - ny0 < 4:
@@ -3468,6 +3502,7 @@ class Overlay:
         a = self.annots.pop(i)
         (x, y), = a["pts"]
         self.start_text(x, y, text=a["text"], px=a["px"], color=a["color"], replaces=a)
+        self.entry["index"] = i                   # (where it goes back if left unchanged)
 
     def blink(self):
         if not self.entry or self.closed:
@@ -3520,26 +3555,46 @@ class Overlay:
         return t
 
     def commit_text(self):
+        """Place the typed text. True if that made a new step to undo."""
         t = self.end_typing()
+        old = t["replaces"]
+        if old and (t["text"], t["px"], t["color"], [(t["x"], t["y"])]) == \
+                (old["text"], old["px"], old["color"], list(old["pts"])):
+            # Only clicked into it and left again: put it back where it was in the
+            # list, so it isn't the next thing Ctrl+Z takes away, and keep redo.
+            self._put_back(old, t.get("index"))
+            self.redraw()
+            return False
         if t["text"].strip():
             a = {"type": "text", "color": t["color"], "width": self.width,
                  "pts": [(t["x"], t["y"])], "text": t["text"], "px": t["px"]}
         elif t["replaces"]:                       # emptied an existing text = delete it
             a = {"type": "deleted", "color": t["color"], "width": self.width, "pts": []}
         else:
-            return
+            return False
         a["replaces"] = t["replaces"]             # so undo can bring the old version back
+        if t.get("index") is not None:
+            a["index"] = t["index"]               # (and to the same place in the list)
         self.annots.append(a)
         self.undone.clear()
         self.redraw()
+        return True
 
     def cancel_text(self):
         """Esc while typing: throw away the edit (an edited text goes back as it was)."""
         t = self.end_typing()
         old = t and t["replaces"]
         if old:
-            self.annots.append(old)
+            self._put_back(old, t.get("index"))
             self.redraw()
+
+    def _put_back(self, a, index):
+        """Put a text back at its old place in the list (it keeps its place for undo
+        and on screen). The place is only a hint: the list may be shorter by now."""
+        if index is None:
+            self.annots.append(a)
+        else:
+            self.annots.insert(min(index, len(self.annots)), a)
 
     def _remove(self, a):
         for i, b in enumerate(self.annots):
@@ -3549,9 +3604,7 @@ class Overlay:
 
     def undo(self):
         if self.entry:                            # typing: undo the text as a whole, but
-            n = len(self.annots)                  # so that Ctrl+Y brings it back
-            self.commit_text()
-            if len(self.annots) == n:
+            if not self.commit_text():            # so that Ctrl+Y brings it back
                 self.redraw()
                 return
         if self.annots:
@@ -3559,7 +3612,7 @@ class Overlay:
             self.undone.append(a)
             old = a.get("replaces")
             if old:                               # an edit: put the previous version back
-                self.annots.append(old)
+                self._put_back(old, a.get("index"))
         self.redraw()
 
     def redo(self):
@@ -3783,7 +3836,10 @@ class Overlay:
                    round((min(x1, px + pw) - px) * s), round((min(y1, py + ph) - py) * sy))
             box = (max(0, min(box[0], im.width - 1)), max(0, min(box[1], im.height - 1)),
                    max(1, min(box[2], im.width)), max(1, min(box[3], im.height)))
-            if box[2] > box[0] and box[3] > box[1] and (x0, y0) >= (px, py) \
+            # (each axis on its own: a selection can reach into the empty space above or
+            # left of a monitor that's offset from the others, and then needs the
+            # general path below, which fills that space and keeps the size right)
+            if box[2] > box[0] and box[3] > box[1] and x0 >= px and y0 >= py \
                     and x1 <= px + pw and y1 <= py + ph:
                 return im.crop(box)
         ex = lambda v: round((v - x0) * s)
@@ -3800,7 +3856,11 @@ class Overlay:
                 continue
             ps, im = p["scale"], p["img"]
             cx, cy = round((ix0 - px) * ps), round((iy0 - py) * ps)
-            if ps == s:                            # same pixels: straight copy
+            # The same scale, give or take a rounding hair: a 2560px monitor at 150% is
+            # 1707 units wide on KDE (1.4997 pixels per unit), and that must count as
+            # equal to a true 1.5, or its piece gets resampled (blurred) by one pixel.
+            same = abs(ps - s) <= s * 0.005
+            if same:                               # same pixels: straight copy
                 cx, cy = min(max(0, cx), im.width - 1), min(max(0, cy), im.height - 1)
                 piece = im.crop((cx, cy, min(cx + w, im.width), min(cy + h, im.height)))
             else:
@@ -3808,7 +3868,7 @@ class Overlay:
                        min(im.height, round((iy1 - py) * ps)))
                 piece = im.crop(box) if box[2] > box[0] and box[3] > box[1] else \
                     Image.new("RGB", (1, 1))
-            if piece.size != (w, h) and ps == s and w - piece.width <= 2 \
+            if piece.size != (w, h) and same and w - piece.width <= 2 \
                     and h - piece.height <= 2:
                 # a pixel short at the monitor's edge (rounding): repeat the edge rather
                 # than resampling (blurring) the whole piece
@@ -3832,19 +3892,52 @@ class Overlay:
         base = self.compose(self.sel, s).convert("RGBA")
         sx, sy = base.width / max(1, x1 - x0), base.height / max(1, y1 - y0)   # (about s)
         marks = Image.new("RGBA", base.size, (0, 0, 0, 0))
-        ink = Image.new("RGBA", base.size, (0, 0, 0, 0))
-        dm, di = ImageDraw.Draw(marks), ImageDraw.Draw(ink)
-        texts = []
+        dm = ImageDraw.Draw(marks)
 
-        for a in self.annots:
-            col = hex_rgb(a["color"]) + (255,)
+        def geom(a):                              # color, line widths, output points
             lw = self.line_px(a["width"])
-            w = max(1, round(lw * s))
-            pts = [((px - x0) * sx, (py - y0) * sy) for px, py in a["pts"]]
-            t = a["type"]
-            if t == "marker":
+            return (hex_rgb(a["color"]) + (255,), lw, max(1, round(lw * s)),
+                    [((px - x0) * sx, (py - y0) * sy) for px, py in a["pts"]])
+
+        def text_layer(ops_list):
+            # Text and the watermark with Pango, exactly like on screen (font fallback for
+            # Chinese, Japanese, emoji; right-to-left shaping), at the output's scale.
+            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, out.width, out.height)
+            cr = cairo.Context(surf)
+            cr.scale(sx, sy)
+            cr.translate(-x0, -y0)
+            for ops in ops_list:
+                self.paint_ops(cr, ops)
+            surf.flush()
+            return Image.frombuffer("RGBA", (out.width, out.height), bytes(surf.get_data()),
+                                    "raw", "BGRa", surf.get_stride(), 1)
+
+        # Like on screen: markers first as one see-through layer, then everything else in
+        # the order it was drawn, so a shape drawn across a label covers it here too.
+        for a in self.annots:
+            if a["type"] == "marker":
+                col, lw, w, pts = geom(a)
                 stroke(dm, pts, col, w * 4)
-            elif t in ("pen", "line"):
+        marks.putalpha(marks.getchannel("A").point(lambda v: v * 45 // 100))
+        out = Image.alpha_composite(base, marks)
+        ink = di = None                           # shapes since the last text
+        texts = []                                # texts since the last shape
+        for a in self.annots:
+            t = a["type"]
+            if t == "text":
+                if ink is not None:               # (shapes drawn before it go under it)
+                    out, ink = Image.alpha_composite(out, ink), None
+                texts.append(self.item_ops(a))
+                continue
+            if t not in ("pen", "line", "rect", "arrow"):
+                continue
+            if texts:                             # (texts drawn before it go under it)
+                out, texts = Image.alpha_composite(out, text_layer(texts)), []
+            if ink is None:
+                ink = Image.new("RGBA", base.size, (0, 0, 0, 0))
+                di = ImageDraw.Draw(ink)
+            col, lw, w, pts = geom(a)
+            if t in ("pen", "line"):
                 stroke(di, pts, col, w)
             elif t == "rect":
                 (ax, ay), (bx2, by2) = pts
@@ -3863,26 +3956,11 @@ class Overlay:
                 stroke(di, [(ax, ay), (hx, hy)], col, w)
                 di.polygon([(bx2, by2), (hx + nx * half, hy + ny * half),
                             (hx - nx * half, hy - ny * half)], fill=col)
-            elif t == "text":
-                texts.append(a)                   # (drawn below, the same way as on screen)
-
-        marks.putalpha(marks.getchannel("A").point(lambda v: v * 45 // 100))
-        out = Image.alpha_composite(Image.alpha_composite(base, marks), ink)
-        wm = self.watermark_ops()
+        if ink is not None:
+            out = Image.alpha_composite(out, ink)
+        wm = self.watermark_ops()                 # (always on top, as on screen)
         if texts or wm:
-            # Text and the watermark with Pango, exactly like on screen (font fallback for
-            # Chinese, Japanese, emoji; right-to-left shaping), at the output's scale.
-            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, out.width, out.height)
-            cr = cairo.Context(surf)
-            cr.scale(sx, sy)
-            cr.translate(-x0, -y0)
-            for a in texts:
-                self.paint_ops(cr, self.item_ops(a))
-            self.paint_ops(cr, wm)
-            surf.flush()
-            layer = Image.frombuffer("RGBA", (out.width, out.height), bytes(surf.get_data()),
-                                     "raw", "BGRa", surf.get_stride(), 1)
-            out = Image.alpha_composite(out, layer)
+            out = Image.alpha_composite(out, text_layer(texts + [wm]))
         return out.convert("RGB")
 
     def watermark_ops(self):
