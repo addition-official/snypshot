@@ -13,7 +13,7 @@
 - The editor could fail to open after taking a screenshot ("returned NULL without setting an exception" in the log), so no screenshot could be taken. The color picker's hue bar is now drawn without the Pillow call that failed.
 - `snypshot --uninstall` now cleans up GNOME and KDE even when run over SSH, from a console or from your other desktop. Before, Print Screen could stop working on the desktop you weren't on, and the GNOME helper stayed installed.
 - `sudo snypshot` now tells you to run it as yourself. Before, `sudo snypshot --uninstall` removed nothing but said snypshot was gone.
-- `snypshot --once` also keeps the screenshot if the editor fails to open, and on KDE it uses the fast KWin capture when it can.
+- `snypshot --once` also keeps the screenshot if the editor fails to open.
 - `snypshot --tray` without an icon path shows an error instead of crashing.
 - If copying fails (for example wl-copy or xclip can't reach the screen), snypshot now says so and keeps the screenshot open, instead of saying "Copied to clipboard" and closing with nothing copied.
 - A typo in `config.json` no longer wipes all your settings the next time you save: the broken file is kept as `config.json.broken` and snypshot starts from the defaults.

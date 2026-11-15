@@ -5236,8 +5236,12 @@ class Preferences:
         keep = {k: self.cfg[k] for k in ("color", "width", "custom", "slot", "last_dir",
                                           "allow_portal")}
         save_config({**json.loads(json.dumps(DEFAULTS)), **keep})
-        for k in SHELL_SHOT_KEYS:                 # GNOME's own screenshot keys as they came
-            gset("reset", SHELL_KEYS, k)
+        if not is_kde() and have("gsettings"):    # GNOME's own screenshot keys as they came
+            for k in SHELL_SHOT_KEYS:             # (not on KDE: that would hand Print to
+                try:                              # GNOME's tool at your next GNOME login)
+                    gset("reset", SHELL_KEYS, k)
+                except (RuntimeError, OSError):
+                    pass
         try:
             apply_hotkey(DEFAULTS["hotkey"], take=True)
         except (ValueError, RuntimeError) as e:
@@ -6309,6 +6313,8 @@ def custom_key_paths():
 
 SHELL_KEYS = "org.gnome.shell.keybindings"
 SHELL_SHOT_KEYS = ("show-screenshot-ui", "screenshot", "screenshot-window")
+SHELL_SHOT_DEFAULTS = {"show-screenshot-ui": "Print", "screenshot": "<Shift>Print",
+                       "screenshot-window": "<Alt>Print"}
 
 
 def norm_accel(a):
@@ -6379,11 +6385,16 @@ def shell_keys_step_aside(accel):
     empty (Print, Shift+Print, Alt+Print) gets its default back first, so moving
     snypshot to another key returns the old one to GNOME. The config remembers which
     keys snypshot emptied, so one you switched off yourself in Settings stays off."""
-    taken = load_config()["shell_taken"]
+    cfg = load_config()
+    taken = cfg["shell_taken"]
     if taken is None:
-        # Older versions didn't keep track, but only ever emptied Print (and gave it
-        # back whenever it was empty), so treat Print as theirs this once.
-        taken = ["show-screenshot-ui"]
+        # Older versions didn't keep track. They always gave Print back when it was
+        # empty, and they emptied whichever of these keys held their own shortcut
+        # (still the saved one here: apply_hotkey saves the new key after this).
+        old = norm_accel(cfg.get("hotkey") or "")
+        taken = ["show-screenshot-ui"] + [
+            k for k, default in SHELL_SHOT_DEFAULTS.items()
+            if old and norm_accel(default) == old and not gsettings_list(SHELL_KEYS, k)]
     now = []
     for key in SHELL_SHOT_KEYS:
         if key in taken and not gsettings_list(SHELL_KEYS, key):
@@ -6577,8 +6588,17 @@ def gnome_unbind():
     except RuntimeError as e:
         print(f"Couldn't remove the shortcut ({e}); remove it in Settings > Keyboard.")
     gset("reset-recursively", f"{MEDIA_KEYS}.custom-keybinding:{KEY_PATH}")
-    for k in SHELL_SHOT_KEYS:                     # GNOME's own screenshot keys, as they were
-        gset("reset", SHELL_KEYS, k)
+    # Give back only the GNOME screenshot keys snypshot emptied; ones you switched off
+    # or changed yourself stay as you left them. (No record: an older version, which
+    # only ever emptied Print and the key matching its own shortcut.)
+    taken = load_config()["shell_taken"]
+    if taken is None:
+        old = norm_accel(load_config().get("hotkey") or "")
+        taken = ["show-screenshot-ui"] + [k for k, d in SHELL_SHOT_DEFAULTS.items()
+                                          if old and norm_accel(d) == old]
+    for k in SHELL_SHOT_KEYS:
+        if k in taken and not gsettings_list(SHELL_KEYS, k):
+            gset("reset", SHELL_KEYS, k)
     if load_config()["shell_taken"]:              # all back to GNOME, none emptied now
         update_config(shell_taken=[])
     print("Print Screen is back to GNOME's screenshot tool.")
@@ -6658,6 +6678,7 @@ def main():
         if not os.environ.get("WAYLAND_DISPLAY") and os.environ.get("XDG_SESSION_TYPE") != "x11":
             log("service: the session hasn't told systemd about the screen yet; retrying")
             sys.exit(1)                           # (never fall back to X11 by accident)
+        rotate_log()                              # (the service path skips the one below)
         py = daemon_python()
         os.execve(py, [py, "-I", SCRIPT, "--daemon", "--foreground"], clean_env())
     if "--bind-key" in args:
