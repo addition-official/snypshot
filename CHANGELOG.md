@@ -11,6 +11,10 @@
 **Fixed**
 - The screenshot no longer shows up in the taskbar with a generic Wayland icon; it uses snypshot's icon.
 - The editor could fail to open after taking a screenshot ("returned NULL without setting an exception" in the log), so no screenshot could be taken. The color picker's hue bar is now drawn without the Pillow call that failed.
+- `snypshot --uninstall` now cleans up GNOME and KDE even when run over SSH, from a console or from your other desktop. Before, Print Screen could stop working on the desktop you weren't on, and the GNOME helper stayed installed.
+- `sudo snypshot` now tells you to run it as yourself. Before, `sudo snypshot --uninstall` removed nothing but said snypshot was gone.
+- `snypshot --once` also keeps the screenshot if the editor fails to open, and on KDE it uses the fast KWin capture when it can.
+- `snypshot --tray` without an icon path shows an error instead of crashing.
 
 ## 1.1.2
 

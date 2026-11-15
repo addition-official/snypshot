@@ -5234,6 +5234,20 @@ def kde_unbind(forget=True):
 KDE_HANDED = os.path.join(os.path.dirname(CONFIG), "kde-handed-back")
 
 
+def kde_was_set_up():
+    """Whether snypshot has a KDE shortcut for you, found without asking KDE (from
+    another desktop, asking could start KDE's shortcut service there)."""
+    if is_kde() or os.path.exists(KDE_HANDED):
+        return True
+    try:
+        with open(os.path.join(xdg("XDG_CONFIG_HOME", "~/.config"), "kglobalshortcutsrc"),
+                  errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return False
+    return any(f"[{c}]" in text for c in (KDE_ACTION[0], KDE_OLD_ACTION[0]))
+
+
 def kde_hand_back():
     """You quit snypshot: its key would do nothing now (on KDE only a running snypshot
     hears it), so give it back to Spectacle until snypshot starts again."""
@@ -6138,6 +6152,10 @@ def resume_hotkeys():
                 KDE_UNBLOCKER.kill()
             KDE_UNBLOCKER = None
         return
+    resume_gnome_hotkeys()
+
+
+def resume_gnome_hotkeys():
     try:
         with open(SUSPENDED) as f:
             saved = json.load(f)
@@ -6195,9 +6213,15 @@ def bind_key(key=None):
 def unbind_key():
     if is_kde():
         return kde_unbind()
+    gnome_unbind()
+
+
+def gnome_unbind():
+    """Take snypshot off GNOME's keys and give Print Screen back to GNOME's tool. Works
+    from any desktop (or none), so uninstalling from elsewhere still cleans up GNOME."""
     if not have("gsettings"):
         return
-    resume_hotkeys()                              # first, so nothing is written back later
+    resume_gnome_hotkeys()                        # first, so nothing is written back later
     try:
         paths = [p for p in custom_key_paths() if p != KEY_PATH]
         gset("set", MEDIA_KEYS, "custom-keybindings", str(paths))
@@ -6274,6 +6298,9 @@ def main():
            and not (i and args[i - 1] == "--tray")]
     if odd:
         sys.exit(f"snypshot: unknown option {odd[0]!r} (see snypshot --help)")
+    if os.geteuid() == 0 and "--version" not in args:
+        # As root it would set up or clean up root's account, not yours, and say it worked.
+        sys.exit("Run snypshot as yourself, without sudo. It asks for your password when needed.")
     if "--service" in args:                       # started by the user service (KDE)
         if not is_kde():
             return                                # (a GNOME session on the same account)
@@ -6326,7 +6353,10 @@ def main():
                                     if cfg["allow_portal"] else "disabled."))
         return
     if "--tray" in args:
-        run_tray(args[args.index("--tray") + 1])
+        i = args.index("--tray")
+        if i + 1 >= len(args):
+            sys.exit("snypshot: --tray needs an icon path")
+        run_tray(args[i + 1])
         return
     if "--quit" in args:
         if send("quit-user") != "ok":
@@ -6410,10 +6440,19 @@ def main():
     if "--uninstall" in args:
         send("quit")
         uninstall()
-        if "gnome" in os.environ.get("XDG_CURRENT_DESKTOP", "").lower():
-            unbind_key()
+        # Clean up every desktop snypshot was set up on, not just the one we're on now
+        # (you might uninstall over SSH, from a console, or from your other desktop).
+        gnome = "gnome" in os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+        if have("gsettings"):
+            try:
+                ours = KEY_PATH in custom_key_paths()
+            except RuntimeError:
+                ours = False
+            if gnome or ours:
+                gnome_unbind()
+        if gnome or os.path.isdir(ext_dir()):
             uninstall_extension()
-        if is_kde():
+        if kde_was_set_up():
             kde_unbind(forget=False)
         files = [f for f in (BIN, ALIAS) if os.path.exists(f) and _ours(f)]
         files += [f for f in (KDE_PY, OLD_KDE_PY) if os.path.exists(f) and _ours_py(f)]
@@ -6437,10 +6476,15 @@ def main():
     if "--once" in args:
         os.chdir("/")
         no_dumps()
+        init_gtk()                                # first: KWin capture needs GTK's monitors
         img = grab_screen()
-        init_gtk()
-        loop = GLib.MainLoop()
-        Overlay(img, on_close=loop.quit, persistent=False)
+        try:
+            loop = GLib.MainLoop()
+            Overlay(img, on_close=loop.quit, persistent=False)
+        except Exception:                         # captured, but the editor broke:
+            log(traceback.format_exc())           # keep the screenshot anyway
+            notify(rescue_capture(img) + " Details: ~/.cache/snypshot/snypshot.log")
+            return
         loop.run()
         return
 
