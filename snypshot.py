@@ -5326,6 +5326,10 @@ def kde_apply_hotkey(accel, take=False):
         for aid, name, _ in owners:
             if aid[0] != SPECTACLE:
                 return name
+    try:                                           # snypshot's own key, to put back if
+        mine = kga("shortcutKeys", "(as)", (KDE_ACTION,), "(a(ai))")[0]   # this fails
+    except RuntimeError:
+        mine = []
     cleared = []
     try:
         for aid, name, keys in owners:
@@ -5347,6 +5351,11 @@ def kde_apply_hotkey(accel, take=False):
         for aid, keys in cleared:                  # snypshot didn't get it: put it back, so
             try:                                   # the key isn't left doing nothing
                 kga("setForeignShortcutKeys", "(asa(ai))", (aid, qt_keys(keys)))
+            except RuntimeError:
+                pass
+        if first_qt(mine):
+            try:
+                kga("setShortcutKeys", "(asa(ai)u)", (KDE_ACTION, mine, 2 | 4), "(a(ai))")
             except RuntimeError:
                 pass
         raise
@@ -5481,7 +5490,11 @@ def kde_hand_back():
         if not got:
             return
         acc = qt_to_accel(got)                     # what it is now, even if you changed it
-        if acc and acc != load_config()["hotkey"]:   # in System Settings: that's the key
+        if acc is None:                            # a key the config can't hold (a keypad
+            kde_restore_spectacle()                # key, for example): leave it set, or the
+            log("KDE: kept your shortcut set while snypshot is off")   # old key comes back
+            return
+        if acc != load_config()["hotkey"]:         # in System Settings: that's the key
             update_config(hotkey=acc)              # to take back at the next start
         os.makedirs(os.path.dirname(KDE_HANDED), exist_ok=True)
         with open(KDE_HANDED, "w") as f:
@@ -5597,14 +5610,6 @@ class KdeShortcut:
     def register(self):
         try:
             kga("blockGlobalShortcuts", "(b)", (False,))   # in case we died mid-recording
-            handed = os.path.exists(KDE_HANDED)
-            try:                                           # KDE had it already (with your
-                known = any(i[0] == KDE_ACTION[1] for i in kga(   # key, or none if you
-                    "allShortcutInfos", reply="(a(ssssssaiai))",  # turned it off)
-                    path="/component/" + KDE_ACTION[0].replace(".", "_"),
-                    iface="org.kde.kglobalaccel.Component")[0])
-            except RuntimeError:
-                known = False
             kde_take_back()                                # after you quit it
             try:
                 kga("unregister", "(ss)", tuple(KDE_OLD_ACTION), "(b)")
@@ -5620,20 +5625,18 @@ class KdeShortcut:
             kga("setShortcutKeys", "(asa(ai)u)", (KDE_ACTION, [([want, 0, 0, 0],)], 2),
                 "(a(ai))")
             got = first_qt(kga("shortcutKeys", "(as)", (KDE_ACTION,), "(a(ai))")[0])
+            # Lost it somehow: put it back. (KDE also drops it when another app takes
+            # the key and that app may let go later, so an empty key here can't be
+            # told apart from you turning it off. Print Screen working wins.)
             if want and not got and not kde_owners(want):
-                if known and not handed:                   # you turned it off in System
-                    update_config(hotkey="")               # Settings: keep it off
-                    saved = want = ""
-                else:                                      # lost it somehow: put it back
-                    got = first_qt(kga("setShortcutKeys", "(asa(ai)u)",
-                                       (KDE_ACTION, [([want, 0, 0, 0],)], 2 | 4),
-                                       "(a(ai))")[0])
+                got = first_qt(kga("setShortcutKeys", "(asa(ai)u)",
+                                   (KDE_ACTION, [([want, 0, 0, 0],)], 2 | 4), "(a(ai))")[0])
             acc = qt_to_accel(got) if got else ""
             if acc and acc != saved:
                 update_config(hotkey=acc)                  # changed in System Settings
             elif want and not got:                         # another app has the key: keep
                 log(f"KDE: {saved} is in use by another shortcut")   # your choice
-            log(f"KDE shortcut: {acc or 'none'}")
+            log(f"KDE shortcut: {acc or ('a key set in System Settings' if got else 'none')}")
         except Exception as e:
             log(f"KDE shortcut service not available: {e}")
 
