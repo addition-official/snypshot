@@ -26,6 +26,10 @@
 - A shape drawn over a text label now covers it in the saved or copied image too, like it does on screen. Before, text always came out on top.
 - Plugging in or removing a monitor while a screenshot is open now closes it, instead of leaving a window that shows and selects the wrong part of the screen.
 - No more GTK warning in the log when there's no keyboard or mouse seat (for example in a headless session) on KDE.
+- Printing to label printers (for example a Dymo) no longer fails with "invalid matrix", and on small labels the screenshot is no longer squeezed into a sliver by page-sized margins. The page is now the real label size.
+- Paper sizes with a decimal point in the name (like "3.5x5" on driverless photo printers) are now laid out on that paper instead of on A4 or Letter.
+- Pressing Cancel or Esc while "Sending to the printer..." is showing no longer brings the screenshot back as if nothing was printed (the job still prints), so you don't print it twice by accident. If that print then fails, a notification says so.
+- After a failed print, Print stays off until the newly chosen printer's settings have loaded, so it can't send the previous printer's paper size and settings to it.
 
 **Security**
 - Saving over an existing file from the Save dialog keeps it as private as it was: a file only you could read no longer becomes readable by everyone.

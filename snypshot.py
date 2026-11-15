@@ -4266,11 +4266,14 @@ def draw_page(cr, pw, ph, img, landscape, fit, gray, unit=1.0):
         cr.translate(0, ph)                        # the left (the usual way, like GTK's)
         cr.rotate(-math.pi / 2)
         pw, ph = ph, pw
-    m = 36
+    m = min(36, 0.06 * min(pw, ph))                # (smaller on label paper, or nothing is left)
     im = img.convert("L").convert("RGBA") if gray else img.convert("RGBA")
     s = min((pw - 2 * m) / im.width, (ph - 2 * m) / im.height)
     if not fit:                                    # (unit: img is a smaller copy)
         s = min(s, 72 / 96 / unit)
+    if s <= 0:                                     # (cairo can't scale by 0: a blank page)
+        cr.restore()
+        return
     cr.translate((pw - im.width * s) / 2, m)
     cr.scale(s, s)
     cr.set_source_surface(pil_surface(im), 0, 0)
@@ -4358,6 +4361,7 @@ class PrintWindow:
         self.busy = False
         self.chooser = None
         self.gen = 0                               # which destination a result is for
+        self.loading = False                       # a printer's settings are on the way
         self.extra = {}                            # CUPS option -> (DropDown, values, default)
         # A smaller copy for the preview (and its black and white version), made once.
         small = img.copy()
@@ -4526,6 +4530,7 @@ class PrintWindow:
         if not getattr(self, "auto", False):
             self.picked = True
         gen, name = self.gen, self.dest_name()
+        self.loading = name != PDF_DEST
         if name == PDF_DEST:
             self.go.set_sensitive(not self.busy)
             self.show_options([])
@@ -4535,7 +4540,8 @@ class PrintWindow:
 
         def done(opts):
             if gen == self.gen:                    # still the chosen printer
-                self.go.set_sensitive(True)
+                self.loading = False
+                self.go.set_sensitive(not self.busy)
                 self.show_options(opts or [])
         self.in_background(lambda: printer_options(name), done)
 
@@ -4567,16 +4573,25 @@ class PrintWindow:
         """The chosen paper as a Gtk.PaperSize (standard names are known to GTK)."""
         i = self.paper_dd.get_selected()
         name = self.papers[i] if 0 <= i < len(self.papers) else "Letter"
-        m = re.fullmatch(r"w(\d+(?:\.\d+)?)h(\d+(?:\.\d+)?)", name.split(".")[0])
+        # "Letter.Fullbleed" -> "Letter". Only these endings: a dot can also be part of
+        # the size itself ("3.5x5", "w288.5h432").
+        base = re.sub(r"(\.(Fullbleed|Borderless|FB))+$", "", name, flags=re.I)
+        # Down to label sizes (a Dymo label is 54 points wide), so the page is the real one.
+        clamp = lambda v: min(max(float(v), 9), 5000)  # noqa: E731
+        m = re.fullmatch(r"w(\d+(?:\.\d+)?)h(\d+(?:\.\d+)?)", base)
         if m:                                      # "w288h432": a size in points
-            w, h = (min(max(float(v), 72), 5000) for v in m.groups())
+            w, h = (clamp(v) for v in m.groups())
             return Gtk.PaperSize.new_custom(name, name, w, h, Gtk.Unit.POINTS)
-        base = name.split(".")[0]                  # "Letter.Fullbleed" -> "Letter"
-        p = Gtk.PaperSize.new_from_ppd(base, base, 0, 0)
-        if not (72 <= p.get_width(Gtk.Unit.POINTS) <= 5000
-                and 72 <= p.get_height(Gtk.Unit.POINTS) <= 5000):
-            p = Gtk.PaperSize.new(Gtk.PaperSize.get_default())
-        return p
+        m = re.fullmatch(r"(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)", base)
+        if m:                                      # "3.5x5": a size in inches
+            w, h = (clamp(float(v) * 72) for v in m.groups())
+            return Gtk.PaperSize.new_custom(name, name, w, h, Gtk.Unit.POINTS)
+        for b in dict.fromkeys((base, name.split(".")[0])):   # (then any other ending cut off)
+            p = Gtk.PaperSize.new_from_ppd(b, b, 0, 0)
+            if (72 <= p.get_width(Gtk.Unit.POINTS) <= 5000
+                    and 72 <= p.get_height(Gtk.Unit.POINTS) <= 5000):
+                return p
+        return Gtk.PaperSize.new(Gtk.PaperSize.get_default())
 
     # --- preview
 
@@ -4625,8 +4640,10 @@ class PrintWindow:
         if self.win is None:
             return
         if resp != Gtk.ResponseType.OK:            # (also closes a Save as PDF window)
-            self.on_finish(self, False)
-        elif self.busy:
+            # While lp is sending, the job can't be taken back: it will print, so this
+            # counts as printed (no screenshot back to print a second copy from).
+            self.on_finish(self, self.busy and self.chooser is None)
+        elif self.busy or self.loading:
             return
         elif self.dest_name() == PDF_DEST:
             self.save_pdf()
@@ -4682,24 +4699,36 @@ class PrintWindow:
 
         def work():
             try:
-                return subprocess.run(cmd + ["--", tmp], capture_output=True, text=True,
-                                      env=clean_env(), timeout=60)
+                r = subprocess.run(cmd + ["--", tmp], capture_output=True, text=True,
+                                   env=clean_env(), timeout=60)
             except (OSError, subprocess.TimeoutExpired) as e:
-                return str(e)
+                r = str(e)
             finally:
                 try:
                     os.remove(tmp)                 # lp has its own copy by now
                 except OSError:
                     pass
-
-        def done(r):
-            self.busy = False
-            self.go.set_sensitive(True)
             if not isinstance(r, subprocess.CompletedProcess) or r.returncode != 0:
                 err = (r.stderr.strip() or r.stdout.strip()) if isinstance(
                     r, subprocess.CompletedProcess) else str(r)
                 log(f"printing failed: {err}")
-                self.status.set_label(f"Couldn't print: {clean_label(err, 200)}")
+                # The window may be closed by now (cancelled while sending): say it here.
+                GLib.idle_add(lambda: (self.win is None and notify(
+                    f"Couldn't print: {clean_label(err, 200)}")) and False)
+            return r
+
+        def done(r):
+            self.busy = False
+            # (not while another printer's settings are still coming: Print would send
+            # the old printer's paper and settings to it)
+            self.go.set_sensitive(not self.loading)
+            if not isinstance(r, subprocess.CompletedProcess) or r.returncode != 0:
+                err = (r.stderr.strip() or r.stdout.strip()) if isinstance(
+                    r, subprocess.CompletedProcess) else str(r)
+                msg = f"Couldn't print: {clean_label(err, 200)}"
+                if self.loading:
+                    msg += " Getting the printer's settings..."
+                self.status.set_label(msg)
                 return
             log(f"print: sent to {name} ({clean_label(r.stdout, 100)})")
             self.on_finish(self, True)
