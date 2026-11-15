@@ -1507,6 +1507,7 @@ DEFAULTS = {
     "classic_picker": False,        # the Windows/Lightshot color dialog instead of ours
     "picker_editor": False,         # our picker opens with the fine-tune editor showing
     "keys": dict(DEFAULT_KEYS),     # shortcuts inside the screenshot
+    "shell_taken": None,            # GNOME screenshot keys snypshot emptied (None: not kept yet)
 }
 ACCEL_RE = re.compile(r"(<(Control|Primary|Shift|Alt|Super|Meta|Hyper)>){0,4}[A-Za-z0-9_]{1,32}")
 
@@ -1564,6 +1565,8 @@ def load_config():
         if not (isinstance(cfg.get(k), str) and os.path.isabs(cfg[k]) and os.path.isdir(cfg[k])):
             cfg[k] = None
     pick("hotkey", lambda v: v == "" or accel_ok(v))      # "" = shortcut switched off
+    pick("shell_taken", lambda v: v is None or (isinstance(v, list)
+                                                and all(x in SHELL_SHOT_KEYS for x in v)))
     pick("save_mode", lambda v: v in ("last", "fixed"))
     pick("name_style", lambda v: v in ("number", "date"))
     pick("name_prefix", prefix_ok)
@@ -6341,14 +6344,24 @@ def apply_hotkey(accel, take=False):
 def shell_keys_step_aside(accel):
     """GNOME's own screenshot keys give up accel. One that an earlier snypshot key left
     empty (Print, Shift+Print, Alt+Print) gets its default back first, so moving
-    snypshot to another key returns the old one to GNOME."""
+    snypshot to another key returns the old one to GNOME. The config remembers which
+    keys snypshot emptied, so one you switched off yourself in Settings stays off."""
+    taken = load_config()["shell_taken"]
+    if taken is None:
+        # Older versions didn't keep track, but only ever emptied Print (and gave it
+        # back whenever it was empty), so treat Print as theirs this once.
+        taken = ["show-screenshot-ui"]
+    now = []
     for key in SHELL_SHOT_KEYS:
-        if not gsettings_list(SHELL_KEYS, key):
+        if key in taken and not gsettings_list(SHELL_KEYS, key):
             gset("reset", SHELL_KEYS, key)
         cur = gsettings_list(SHELL_KEYS, key)
         keep = [x for x in cur if norm_accel(x) != norm_accel(accel)]
         if keep != cur:
             gset("set", SHELL_KEYS, key, str(keep))
+        if not keep and (cur or key in taken):    # emptied by us now, or still from before
+            now.append(key)
+    update_config(shell_taken=now)
 
 
 SUSPENDED = os.path.join(xdg("XDG_CACHE_HOME", "~/.cache"),
@@ -6388,14 +6401,14 @@ def suspend_hotkeys():
     if not have("gsettings") or os.path.exists(SUSPENDED):
         return
     try:
-        saved = {"ours": gset("get", f"{MEDIA_KEYS}.custom-keybinding:{KEY_PATH}",
-                              "binding").strip("'"),
-                 "shell": {k: gsettings_list(SHELL_KEYS, k) for k in SHELL_SHOT_KEYS}}
+        ours = gset("get", f"{MEDIA_KEYS}.custom-keybinding:{KEY_PATH}", "binding").strip("'")
+        shell = {k: gsettings_list(SHELL_KEYS, k) for k in SHELL_SHOT_KEYS}
     except RuntimeError:
         return                                    # can't remember them: don't touch them
-    if not (restorable(saved["ours"])
-            and all(restorable(x) for v in saved["shell"].values() for x in v)):
-        return                                    # couldn't put them back: don't touch them
+    # Only switch off the keys we can write back as they were. One with a spelling we
+    # can't (like <Ctrl><Alt>Print) stays on, and the rest are still switched off.
+    saved = {"ours": ours if restorable(ours) else None,
+             "shell": {k: v for k, v in shell.items() if all(restorable(x) for x in v)}}
     cache_dir()
     try:
         fd = os.open(SUSPENDED, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
@@ -6409,8 +6422,9 @@ def suspend_hotkeys():
         except OSError:
             pass
         return
-    gset("set", f"{MEDIA_KEYS}.custom-keybinding:{KEY_PATH}", "binding", "''")
-    for k in SHELL_SHOT_KEYS:
+    if saved["ours"] is not None:
+        gset("set", f"{MEDIA_KEYS}.custom-keybinding:{KEY_PATH}", "binding", "''")
+    for k in saved["shell"]:
         gset("set", SHELL_KEYS, k, "[]")
 
 
@@ -6532,6 +6546,8 @@ def gnome_unbind():
     gset("reset-recursively", f"{MEDIA_KEYS}.custom-keybinding:{KEY_PATH}")
     for k in SHELL_SHOT_KEYS:                     # GNOME's own screenshot keys, as they were
         gset("reset", SHELL_KEYS, k)
+    if load_config()["shell_taken"]:              # all back to GNOME, none emptied now
+        update_config(shell_taken=[])
     print("Print Screen is back to GNOME's screenshot tool.")
 
 

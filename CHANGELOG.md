@@ -36,8 +36,8 @@
 - KDE: snypshot no longer gives Print Screen back to "Launch Spectacle" when you turned that off yourself.
 - KDE: Alt+Print Screen can now be chosen as the shortcut (it was recorded as "Sys Req", which KDE refused).
 - GNOME: if the computer crashed or lost power while you were picking a new shortcut in Preferences, Print Screen could stay dead for good (for snypshot and for GNOME's own tool), and picking a key later no longer worked properly. snypshot now gives the keys back at the next start.
-- GNOME: picking a shortcut no longer wipes a GNOME screenshot key that was set up with an unusual spelling (like `<Ctrl><Alt>Print`).
-- GNOME: moving snypshot off Shift+Print or Alt+Print now gives that key back to GNOME's screenshot tool. Before, only Print Screen came back.
+- GNOME: picking a shortcut no longer wipes a GNOME screenshot key that was set up with an unusual spelling (like `<Ctrl><Alt>Print`). That key stays on while you pick; the others are still switched off so the key you press reaches Preferences.
+- GNOME: moving snypshot off Shift+Print or Alt+Print now gives that key back to GNOME's screenshot tool. Before, only Print Screen came back. snypshot remembers which of GNOME's screenshot keys it took, so one you switched off yourself in Settings stays off.
 - The log file (`~/.cache/snypshot/snypshot.log`) no longer grows forever: once it passes 1 MB it is moved to `snypshot.log.old` the next time snypshot starts in the background.
 
 **Security**
