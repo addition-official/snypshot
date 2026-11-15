@@ -5129,6 +5129,8 @@ class Preferences:
         if name == "BackSpace" and not mods:
             accel = ""
         else:
+            if name == "Sys_Req" and mods & Gdk.ModifierType.ALT_MASK:
+                keyval = Gdk.KEY_Print             # Alt turns Print Screen into this
             ch = Gdk.keyval_to_unicode(keyval)
             if ch > 127:                           # e.g. Cyrillic: record the key as it is
                 ok, base, *_ = self.win.get_display().translate_key(keycode, 0, 0)
@@ -5158,7 +5160,7 @@ class Preferences:
             self.hotkey_btn.set_label(accel_label(self.cfg["hotkey"]))
             dlg = Gtk.AlertDialog(message=f"“{other}” already uses {accel_label(accel)}",
                                   detail=f"Give {accel_label(accel)} to snypshot? "
-                                         f"“{other}” stays, just without a key.",
+                                         f"“{other}” stays, just without this key.",
                                   buttons=["Cancel", "Use it for snypshot"],
                                   cancel_button=0, default_button=1)
 
@@ -5258,6 +5260,8 @@ def qt_to_accel(code):
     mods = "".join(f"<{m}>" for m, v in (("Shift", 0x02000000), ("Control", 0x04000000),
                                         ("Alt", 0x08000000), ("Super", 0x10000000))
                    if code & v)
+    if code & 0x20000000:                          # a keypad key: GTK names those differently
+        return None
     key = code & 0x01FFFFFF
     names = {v: k for k, v in QT_KEYS.items()}
     if 0x01000030 <= key < 0x01000030 + 35:
@@ -5297,33 +5301,54 @@ def first_qt(keys):
 
 
 def kde_owners(qt):
-    """Other shortcuts on this key: [(actionId list, friendly name)]."""
+    """Other shortcuts on this key: [(actionId list, friendly name, all its keys)]."""
     out = []
     for (uname, fname, comp, cfname, ctx, cxf, keys, dflt) in kga(
             "globalShortcutsByKey", "((ai)(i))", (([qt, 0, 0, 0],), (0,)),
             "(a(ssssssaiai))")[0]:
         if comp not in (KDE_ACTION[0], KDE_OLD_ACTION[0]):
-            out.append(([comp, uname, cfname, fname], f"{cfname}: {fname}"))
+            out.append(([comp, uname, cfname, fname], f"{cfname}: {fname}",
+                        [int(k) for k in keys if k]))
     return out
+
+
+def qt_keys(keys):
+    """[k1, k2] -> the shortcut list KDE wants ([0] for none)."""
+    return [([k, 0, 0, 0],) for k in keys] or [([0, 0, 0, 0],)]
 
 
 def kde_apply_hotkey(accel, take=False):
     """KDE version of apply_hotkey (same contract)."""
     qt = accel_to_qt(accel)
-    if qt:
-        for aid, name in kde_owners(qt):
-            if aid[0] != SPECTACLE and not take:
+    owners = kde_owners(qt) if qt else []
+    if not take:                                   # ask first, before touching anything
+        for aid, name, _ in owners:
+            if aid[0] != SPECTACLE:
                 return name
+    cleared = []
+    try:
+        for aid, name, keys in owners:
             if aid[0] == SPECTACLE:                # remember it, to give it back later
-                taken = kde_taken_load()
-                if [aid[1], qt] not in taken:
-                    kde_taken_save(taken + [[aid[1], qt]])
-            kga("setForeignShortcutKeys", "(asa(ai))", (aid, [([0, 0, 0, 0],)]))
-    kga("doRegister", "(as)", (KDE_ACTION,))
-    got = kga("setShortcutKeys", "(asa(ai)u)", (KDE_ACTION, [([qt, 0, 0, 0],)], 2 | 4),
-              "(a(ai))")[0]
-    if qt and first_qt(got) != qt:
-        raise RuntimeError("KDE didn't accept that shortcut.")
+                taken = [t for t in kde_taken_load() if t[:2] != [aid[1], qt]]
+                old = [k for t in taken if t[0] == aid[1] for k in t[2] or []]
+                before = list(dict.fromkeys(keys + old))[:19]   # (with keys taken earlier)
+                kde_taken_save(taken + [[aid[1], qt, before]])
+            # Take only this key: the action keeps any other keys it has.
+            kga("setForeignShortcutKeys", "(asa(ai))",
+                (aid, qt_keys([k for k in keys if k != qt])))
+            cleared.append((aid, keys))
+        kga("doRegister", "(as)", (KDE_ACTION,))
+        got = kga("setShortcutKeys", "(asa(ai)u)", (KDE_ACTION, [([qt, 0, 0, 0],)], 2 | 4),
+                  "(a(ai))")[0]
+        if qt and first_qt(got) != qt:
+            raise RuntimeError("KDE didn't accept that shortcut.")
+    except RuntimeError:
+        for aid, keys in cleared:                  # snypshot didn't get it: put it back, so
+            try:                                   # the key isn't left doing nothing
+                kga("setForeignShortcutKeys", "(asa(ai))", (aid, qt_keys(keys)))
+            except RuntimeError:
+                pass
+        raise
     update_config(hotkey=accel or "")
     try:
         kde_restore_spectacle()                    # e.g. Print, if you moved off it
@@ -5336,12 +5361,25 @@ KDE_TAKEN = os.path.join(os.path.dirname(CONFIG), "kde-spectacle-keys.json")
 
 
 def kde_taken_load():
-    """Spectacle keys snypshot took: [[action, key], ...]."""
+    """Spectacle keys snypshot took: [[action, key, the action's keys before], ...]. The
+    last part is None for entries saved by older versions."""
+    def ok(k):
+        return isinstance(k, int) and not isinstance(k, bool) and 0 < k < 2 ** 31
     try:
         with open(KDE_TAKEN) as f:
             data = json.load(f)
-        return [[a, k] for a, k in data if isinstance(a, str) and len(a) < 100
-                and isinstance(k, int) and not isinstance(k, bool) and 0 < k < 2 ** 31][:50]
+        out = []
+        for item in data:
+            if not isinstance(item, list):
+                continue
+            a, k, before = (item + [None])[:3]
+            if not (isinstance(a, str) and len(a) < 100 and ok(k)):
+                continue
+            if not (before is None or isinstance(before, list) and len(before) < 20
+                    and all(ok(b) for b in before)):
+                continue
+            out.append([a, k, before])
+        return out[:50]
     except (OSError, ValueError, TypeError):
         return []
 
@@ -5359,9 +5397,9 @@ def kde_taken_save(items):
 
 
 def kde_restore_spectacle():
-    """Give Spectacle back the keys snypshot took from it (and Print Screen for
-    "Launch Spectacle"), once nothing else uses them. You changing a Spectacle key
-    yourself wins. Returns True if Print Screen is Spectacle's now."""
+    """Give Spectacle back the keys snypshot took from it, once nothing else uses
+    them. You changing a Spectacle key yourself wins. Returns True if Print Screen is
+    Spectacle's now."""
     path = "/component/" + SPECTACLE.replace(".", "_")
     try:
         infos = kga("allShortcutInfos", reply="(a(ssssssaiai))", path=path,
@@ -5372,26 +5410,30 @@ def kde_restore_spectacle():
         ours = first_qt(kga("shortcutKeys", "(as)", (KDE_ACTION,), "(a(ai))")[0])
     except RuntimeError:
         ours = 0
+    # (Only keys snypshot took. A Spectacle key you turned off yourself stays off.)
     taken = kde_taken_load()
-    todo = taken + [["_launch", QT_KEYS["Print"]]]
     info = {i[0]: i for i in infos}
-    keep = []
-    for action, key in todo:
+    keep, cur = [], {}
+    for action, key, before in taken:
         if action not in info:
             continue
         uname, fname, comp, cfname, ctx, cxf, keys, dflt = info[action]
-        if any(keys) or (action == "_launch" and key not in dflt):
-            continue                               # it has a key again (or never had it)
+        now = cur.setdefault(action, [int(k) for k in keys if k])
+        if key in now:
+            continue                               # it has that key again
+        if not set(now) <= set(before or []):
+            continue                               # you gave it other keys since: yours win
         if key == ours or kde_owners(key):
-            if [action, key] in taken and [action, key] not in keep:
-                keep.append([action, key])         # still in use: try again next time
+            if [action, key, before] not in keep:
+                keep.append([action, key, before])   # still in use: try again next time
             continue
-        kga("setForeignShortcutKeys", "(asa(ai))",
-            ([comp, uname, cfname, fname], [([key, 0, 0, 0],)]))
+        order = (before or []) + [key]             # its other keys stay, in the old order
+        now[:] = sorted(set(now) | {key}, key=order.index)
+        kga("setForeignShortcutKeys", "(asa(ai))", ([comp, uname, cfname, fname], qt_keys(now)))
     if keep != taken:
         kde_taken_save(keep)
     owners = kde_owners(QT_KEYS["Print"])
-    return any(aid[0] == SPECTACLE for aid, _ in owners)
+    return any(aid[0] == SPECTACLE for aid, *_ in owners)
 
 
 def kde_unbind(forget=True):
@@ -5437,6 +5479,9 @@ def kde_hand_back():
         got = first_qt(kga("shortcutKeys", "(as)", (KDE_ACTION,), "(a(ai))")[0])
         if not got:
             return
+        acc = qt_to_accel(got)                     # what it is now, even if you changed it
+        if acc and acc != load_config()["hotkey"]:   # in System Settings: that's the key
+            update_config(hotkey=acc)              # to take back at the next start
         os.makedirs(os.path.dirname(KDE_HANDED), exist_ok=True)
         with open(KDE_HANDED, "w") as f:
             f.write("1\n")
@@ -5512,8 +5557,11 @@ def kde_status():
     else:
         parts.append("using Spectacle (run setup for faster, sharper screenshots)")
     try:
-        acc = qt_to_accel(first_qt(kga("shortcutKeys", "(as)", (KDE_ACTION,), "(a(ai))")[0]))
-        parts.append(f"shortcut: {accel_label_plain(acc) if acc else 'none'}"
+        got = first_qt(kga("shortcutKeys", "(as)", (KDE_ACTION,), "(a(ai))")[0])
+        acc = qt_to_accel(got)
+        shown = (accel_label_plain(acc) if acc else    # (a keypad key, for example)
+                 "set in System Settings" if got else "none")
+        parts.append(f"shortcut: {shown}"
                      + ("" if send("ping") == "ok" else " (snypshot isn't running, so it "
                         "does nothing right now)"))
     except RuntimeError as e:
@@ -5548,6 +5596,14 @@ class KdeShortcut:
     def register(self):
         try:
             kga("blockGlobalShortcuts", "(b)", (False,))   # in case we died mid-recording
+            handed = os.path.exists(KDE_HANDED)
+            try:                                           # KDE had it already (with your
+                known = any(i[0] == KDE_ACTION[1] for i in kga(   # key, or none if you
+                    "allShortcutInfos", reply="(a(ssssssaiai))",  # turned it off)
+                    path="/component/" + KDE_ACTION[0].replace(".", "_"),
+                    iface="org.kde.kglobalaccel.Component")[0])
+            except RuntimeError:
+                known = False
             kde_take_back()                                # after you quit it
             try:
                 kga("unregister", "(ss)", tuple(KDE_OLD_ACTION), "(b)")
@@ -5563,13 +5619,18 @@ class KdeShortcut:
             kga("setShortcutKeys", "(asa(ai)u)", (KDE_ACTION, [([want, 0, 0, 0],)], 2),
                 "(a(ai))")
             got = first_qt(kga("shortcutKeys", "(as)", (KDE_ACTION,), "(a(ai))")[0])
-            if want and not got and not kde_owners(want):   # lost it somehow: put it back
-                got = first_qt(kga("setShortcutKeys", "(asa(ai)u)",
-                                   (KDE_ACTION, [([want, 0, 0, 0],)], 2 | 4), "(a(ai))")[0])
+            if want and not got and not kde_owners(want):
+                if known and not handed:                   # you turned it off in System
+                    update_config(hotkey="")               # Settings: keep it off
+                    saved = want = ""
+                else:                                      # lost it somehow: put it back
+                    got = first_qt(kga("setShortcutKeys", "(asa(ai)u)",
+                                       (KDE_ACTION, [([want, 0, 0, 0],)], 2 | 4),
+                                       "(a(ai))")[0])
             acc = qt_to_accel(got) if got else ""
             if acc and acc != saved:
                 update_config(hotkey=acc)                  # changed in System Settings
-            elif want and not acc:                         # another app has the key: keep
+            elif want and not got:                         # another app has the key: keep
                 log(f"KDE: {saved} is in use by another shortcut")   # your choice
             log(f"KDE shortcut: {acc or 'none'}")
         except Exception as e:
