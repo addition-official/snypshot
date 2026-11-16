@@ -1881,6 +1881,14 @@ def init_gtk():
     gi.require_version("Graphene", "1.0")
     from gi.repository import PangoCairo as _PangoCairo, GLib as _GLib, Gio as _Gio
     from gi.repository import Gsk as _Gsk, Graphene as _Graphene
+    # Load the backend's own bits now, before any window exists: a window made earlier
+    # gets a plain Python type without methods like export_handle (see export_parent).
+    for _name in ("GdkWayland", "GdkX11"):
+        try:
+            gi.require_version(_name, "4.0")
+            __import__("gi.repository." + _name)
+        except (ValueError, ImportError):
+            pass
     import cairo as _cairo
     Gtk, Gdk, Pango, PangoCairo, cairo = _Gtk, _Gdk, _Pango, _PangoCairo, _cairo
     GLib, Gio, Gsk, Graphene = _GLib, _Gio, _Gsk, _Graphene
@@ -2078,6 +2086,8 @@ class Overlay:
         self.dialog_open = False
         self.dialog_win = None
         self.hidden = False
+        self.dialog_on_top = False                # a dialog sitting on top of the screenshot
+        self.parent_handle = None
         self.monitors_stale = False               # monitors changed while hidden
 
         # One fullscreen window per monitor, fully drawn before it appears.
@@ -2208,10 +2218,11 @@ class Overlay:
     # --- events -> desktop coordinates
 
     def _drag_begin(self, g, x, y, area):
-        if self.dialog_open:                      # the screenshot should be hidden now;
-            self.drag_origin = None               # if you can click it anyway, the dialog
-            self.cancel_dialog()                  # gives way (never a dead screen)
-            return
+        if self.dialog_open:
+            self.drag_origin = None
+            if not self.dialog_on_top:            # the screenshot should be hidden now;
+                self.cancel_dialog()              # if you can click it anyway, the dialog
+            return                                # gives way (never a dead screen)
         self.drag_origin = (round(area.region[0] + x), round(area.region[1] + y))
         self.shift = bool(g.get_current_event_state() & Gdk.ModifierType.SHIFT_MASK)
         self.press(*self.drag_origin)
@@ -2242,6 +2253,8 @@ class Overlay:
                 self.redraw_rects([old, getattr(self, "label_rect", None)])
 
     def _scroll(self, ctl, dx, dy):
+        if self.dialog_open:
+            return True
         if dy:
             self.brush(-1 if dy < 0 else 1, *self.mouse)   # wheel up: thinner, down: thicker
         return True
@@ -4228,7 +4241,6 @@ class Overlay:
         self.dialog_open = True
         self.dialog_win = None
         self.ring = None
-        self.let_go()                              # hide the overlay while printing
 
         def finish(win, done):
             if self.dialog_win is not win:
@@ -4243,29 +4255,53 @@ class Overlay:
         def portal_ended(job, result):
             if self.dialog_win is not job:
                 return
-            if result == "unavailable":           # no print portal: our own window
-                self.dialog_win = None
-                show_own()
+            self.drop_parent()
+            if result == "unavailable":           # no print portal: our own window,
+                self.dialog_win = None            # with the screenshot out of its way
+                self.dialog_on_top = False
+                if not self.hidden:
+                    self.let_go()
+                    GLib.timeout_add(120, show_own)
+                else:
+                    show_own()
                 return
             self.dialog_win = None
             self.dialog_open = False
+            self.dialog_on_top = False
             if self.closed:
                 return
             if result == "failed":
                 notify("Printing didn't work. Details: ~/.cache/snypshot/snypshot.log")
             self.close() if result == "done" else self.back_from_dialog()
 
-        def show():                                # once the screenshot is off screen
+        def show(parent):
             if self.closed or not self.dialog_open:
                 return False
             try:
                 job = PortalPrint(img, self.out_scale(self.sel),
-                                  lambda result: portal_ended(job, result))
+                                  lambda result: portal_ended(job, result), parent)
                 self.dialog_win = job
             except Exception:
                 log("print portal helper failed:\n" + traceback.format_exc())
+                self.drop_parent()
+                self.dialog_on_top = False
+                if not self.hidden:
+                    self.let_go()
                 show_own()
             return False
+
+        def start(parent):
+            """Like Lightshot, the print dialog sits on top of the screenshot. Without a
+            way to tell the dialog which window it belongs to, it could open behind
+            the full-screen screenshot, so then the screenshot steps aside instead."""
+            if self.closed or not self.dialog_open:
+                return
+            self.dialog_on_top = bool(parent)
+            if parent:
+                show(parent)
+            else:
+                self.let_go()                     # hide the overlay while printing
+                GLib.timeout_add(120, show, "")
 
         def show_own():
             if self.closed or not self.dialog_open:
@@ -4282,7 +4318,66 @@ class Overlay:
                 self.back_from_dialog()
                 notify(f"Couldn't open the print window ({e}).")
             return False
-        GLib.timeout_add(120, show)
+        self.export_parent(start)
+
+    def export_parent(self, done):
+        """Calls done(handle): a name for the screenshot window (the monitor with the
+        selection) that another program's dialog can attach itself to, so it stays on
+        top of it. "" if that isn't possible here."""
+        self.parent_handle = None
+        answered = []
+
+        def reply(handle):
+            if not answered:
+                answered.append(1)
+                done(handle)
+            return False
+        try:
+            x0, y0, x1, y1 = self.sel
+            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+            i = next((i for i, (mx, my, mw, mh) in enumerate(self.monitors)
+                      if mx <= cx < mx + mw and my <= cy < my + mh), 0)
+            surf = self.wins[i].get_surface()
+            if WAYLAND:
+                import gi
+                gi.require_version("GdkWayland", "4.0")
+                from gi.repository import GdkWayland
+                if isinstance(surf, GdkWayland.WaylandToplevel):
+                    def got(_top, handle, *_):
+                        if handle:
+                            self.parent_handle = (surf, handle)
+                            if answered:          # too late: already went on without it
+                                self.drop_parent()
+                        reply(f"wayland:{handle}" if handle else "")
+                    # (called through the class: the window was made before GdkWayland
+                    # was loaded, so the object itself doesn't know these methods)
+                    if GdkWayland.WaylandToplevel.export_handle(surf, got):
+                        GLib.timeout_add(1000, reply, "")   # (no answer: don't wait forever)
+                        return
+            else:
+                import gi
+                gi.require_version("GdkX11", "4.0")
+                from gi.repository import GdkX11
+                if isinstance(surf, GdkX11.X11Surface):
+                    reply(f"x11:{GdkX11.X11Surface.get_xid(surf):x}")
+                    return
+        except Exception as e:
+            log(f"print: couldn't put the dialog on top of the screenshot: {e}")
+        reply("")
+
+    def drop_parent(self):
+        ph, self.parent_handle = getattr(self, "parent_handle", None), None
+        if ph:
+            surf, handle = ph
+            try:
+                from gi.repository import GdkWayland
+                T = GdkWayland.WaylandToplevel
+                if hasattr(T, "drop_exported_handle"):
+                    T.drop_exported_handle(surf, handle)
+                else:
+                    T.unexport_handle(surf)
+            except Exception:
+                pass
 
     def back_from_dialog(self):
         if self.monitors_stale:                   # the monitors changed meanwhile: the
@@ -4355,7 +4450,10 @@ def draw_page(cr, pw, ph, img, landscape, fit, gray, unit=1.0):
 PORTAL_PDF_MAX = 512 << 20
 
 
-def run_print_portal():
+PARENT_HANDLE = re.compile(r"(wayland|x11):[A-Za-z0-9_.:{}-]{1,200}")
+
+
+def run_print_portal(parent=""):
     """--print-portal: the helper (a child of snypshot, talking JSON lines over a pipe).
     Says {"event": "prepared", ...} with the dialog's choices, then reads the PDF
     ("<size>\\n" + bytes) from stdin and says "done", "cancelled", "failed" or
@@ -4376,6 +4474,8 @@ def run_print_portal():
         return
     sender = bus.get_unique_name()[1:].replace(".", "_")
     title = "snypshot screenshot"
+    if not PARENT_HANDLE.fullmatch(parent or ""):
+        parent = ""                               # (the dialog then has no parent window)
     loop = GLib.MainLoop()
     state = {"handle": None, "result": None}
 
@@ -4441,7 +4541,7 @@ def run_print_portal():
 
     try:
         res = ask("PreparePrint", {"sig": "(ssa{sv}a{sv}a{sv})",
-                                   "args": ("", title, {}, {}),
+                                   "args": (parent, title, {}, {}),
                                    "opts": {"modal": GLib.Variant("b", True)}})
     except Exception as e:
         say("unavailable", msg=str(e))
@@ -4466,7 +4566,8 @@ def run_print_portal():
         opts = {}
         if "token" in results:
             opts["token"] = GLib.Variant("u", int(results["token"]))
-        res = ask("Print", {"sig": "(ssha{sv})", "args": ("", title, idx), "opts": opts}, fds)
+        res = ask("Print", {"sig": "(ssha{sv})", "args": (parent, title, idx), "opts": opts},
+                  fds)
     except Exception as e:
         say("failed", msg=str(e))
         return
@@ -4507,13 +4608,14 @@ class PortalPrint:
     "failed" or "unavailable". Stands in for a dialog window: present() and
     response() cancel it (Print Screen while it's up brings the screenshot back)."""
 
-    def __init__(self, img, unit, on_end):
+    def __init__(self, img, unit, on_end, parent=""):
         import threading
         self.img, self.unit, self.on_end = img, unit, on_end
+        extra = [parent] if PARENT_HANDLE.fullmatch(parent or "") else []
         self.ended = self.prepared = False
         with os.fdopen(log_fd(), "a") as err:
             self.proc = subprocess.Popen(
-                [sys.executable, "-I", SCRIPT, "--print-portal"], stdin=subprocess.PIPE,
+                [sys.executable, "-I", SCRIPT, "--print-portal", *extra], stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=err, env=clean_env())
         threading.Thread(target=self._read, daemon=True).start()
 
@@ -6925,11 +7027,12 @@ def main():
         print((__doc__ or "").split("\nPrivacy:")[0].strip())
         return
     odd = [a for i, a in enumerate(args) if a not in FLAGS
-           and not (i and args[i - 1] == "--tray")]
+           and not (i and args[i - 1] in ("--tray", "--print-portal"))]
     if odd:
         sys.exit(f"snypshot: unknown option {odd[0]!r} (see snypshot --help)")
     if "--print-portal" in args:                  # the print dialog helper (see PortalPrint)
-        run_print_portal()
+        i = args.index("--print-portal")
+        run_print_portal(args[i + 1] if i + 1 < len(args) else "")
         return
     if os.geteuid() == 0 and "--version" not in args:
         # As root it would set up or clean up root's account, not yours, and say it worked.
