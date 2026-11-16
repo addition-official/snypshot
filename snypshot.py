@@ -5676,6 +5676,94 @@ def qt_to_accel(code):
     return mods + name
 
 
+# Like Lightshot, the screenshot stays on top of everything while it's open: a window
+# that pops up meanwhile (Zoom after screen sharing ends, a chat, a notification
+# window) must not cover it on any monitor. Wayland apps can't ask for that themselves,
+# so on KDE snypshot loads this small KWin script. It marks the screenshot's windows
+# "keep above", keeps them out of the taskbar and Alt+Tab, raises them back over any
+# window that climbs above them, and takes focus back from other apps. Dialogs that
+# belong to the screenshot (the print dialog) stay on top of it. Works on Plasma 5 and 6.
+KWIN_SCRIPT_NAME = "snypshot-keep-on-top"
+KWIN_SCRIPT = r"""
+function isShot(w) { return !!w && w.resourceClass == "snypshot" && w.caption == "snypshot"; }
+function ours(w) {          // snypshot's windows, or a dialog attached to one
+    for (var i = 0; w && i < 10; i++) {
+        if (w.resourceClass == "snypshot") return true;
+        w = w.transientFor;
+    }
+    return false;
+}
+function all() { return workspace.windowList ? workspace.windowList() : workspace.clientList(); }
+function shots() { var r = [], l = all(); for (var i = 0; i < l.length; i++) if (isShot(l[i])) r.push(l[i]); return r; }
+function setUp(w) {
+    if (!isShot(w)) return;
+    w.keepAbove = true; w.skipTaskbar = true; w.skipSwitcher = true; w.skipPager = true;
+}
+var busy = false;
+function keepUp() {         // Plasma 6: raise a screenshot window back over anything above it
+    if (busy || !workspace.raiseWindow || !workspace.stackingOrder) return;
+    busy = true;
+    try {
+        var st = workspace.stackingOrder;
+        for (var i = 0; i < st.length; i++) {
+            if (!isShot(st[i])) continue;
+            for (var j = i + 1; j < st.length; j++) {
+                var x = st[j];
+                if (!ours(x) && (x.normalWindow || x.dialog || x.utility || x.splash)) {
+                    workspace.raiseWindow(st[i]);
+                    break;
+                }
+            }
+        }
+    } finally { busy = false; }
+}
+function activated(w) {     // another app took focus while the screenshot is up: take it back
+    if (!w || ours(w)) return;
+    var s = shots();
+    if (!s.length) return;
+    if (workspace.windowList) workspace.activeWindow = s[0]; else workspace.activeClient = s[0];
+}
+var l = all();
+for (var i = 0; i < l.length; i++) setUp(l[i]);
+function added(w) { setUp(w); keepUp(); }
+if (workspace.windowAdded) workspace.windowAdded.connect(added); else workspace.clientAdded.connect(added);
+if (workspace.windowActivated) workspace.windowActivated.connect(activated);
+else if (workspace.clientActivated) workspace.clientActivated.connect(activated);
+if (workspace.stackingOrderChanged) workspace.stackingOrderChanged.connect(keepUp);
+"""
+
+
+def kwin_scripting(method, sig=None, args=None, reply=None):
+    from gi.repository import Gio, GLib as G
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    res = bus.call_sync("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", method,
+                        G.Variant(sig, args) if sig else None,
+                        G.VariantType(reply) if reply else None, Gio.DBusCallFlags.NONE,
+                        3000, None)
+    return res.unpack() if res is not None else None
+
+
+def kwin_keep_on_top(on=True):
+    """Load (or with on=False, unload) the keep-on-top KWin script. Never raises."""
+    try:
+        if kwin_scripting("isScriptLoaded", "(s)", (KWIN_SCRIPT_NAME,), "(b)")[0]:
+            kwin_scripting("unloadScript", "(s)", (KWIN_SCRIPT_NAME,), "(b)")
+        if not on:
+            return
+        path = os.path.join(private_dir(), "keep-on-top.js")
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(KWIN_SCRIPT)
+        kwin_scripting("loadScript", "(ss)", (path, KWIN_SCRIPT_NAME), "(i)")
+        kwin_scripting("start")
+    except Exception as e:
+        log(f"couldn't keep the screenshot on top with KWin: {e}")
+
+
 def kga(method, sig=None, args=None, reply=None, path="/kglobalaccel",
         iface="org.kde.KGlobalAccel"):
     """Call KDE's global shortcut service (kglobalaccel). Errors become RuntimeError."""
@@ -6237,6 +6325,7 @@ class Daemon:
                 self.kde_keys = KdeShortcut(self)
             except Exception as e:
                 log(f"KDE shortcut service not available: {e}")
+            kwin_keep_on_top()                    # the screenshot always stays on top
             if os.path.isfile(KDE_PY) and not kde_py_current():
                 log("Python was updated; snypshot's copy is out of date (using Spectacle)")
                 notify("Python was updated, so screenshots are slower for now. Run "
@@ -6412,6 +6501,8 @@ class Daemon:
             self.prefs.stop_recording(cancel=True)   # give the screenshot keys back
         if hand_back and is_kde():
             kde_hand_back()                       # so Print Screen still does something
+        if is_kde():
+            kwin_keep_on_top(False)               # leave nothing behind in KWin
         if self.tray and self.tray.poll() is None:
             self.tray.terminate()
         try:
