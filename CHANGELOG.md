@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.2
 
 **Changed**
 - KDE: the screenshot now stays on top of everything on every monitor while it's open, like Lightshot. Windows that pop up meanwhile (for example Zoom when screen sharing ends) can't cover it or take focus from it, and it no longer shows up in the taskbar or Alt+Tab. Dialogs that belong to it, like the print dialog, still open on top of it.
