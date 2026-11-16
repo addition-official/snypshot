@@ -2088,6 +2088,7 @@ class Overlay:
         self.hidden = False
         self.dialog_on_top = False                # a dialog sitting on top of the screenshot
         self.parent_handle = None
+        self.print_attempt = None
         self.monitors_stale = False               # monitors changed while hidden
 
         # One fullscreen window per monitor, fully drawn before it appears.
@@ -2149,7 +2150,12 @@ class Overlay:
         if self.hidden or self.dialog_open:
             # Hidden for a Save or Print dialog: closing now would cancel the dialog and
             # lose the work, and the windows don't matter while hidden. Deal with it if
-            # the screenshot comes back instead (back_from_dialog).
+            # the screenshot comes back instead (back_from_dialog). A print dialog on top
+            # of the screenshot: hide the screenshot now (its windows no longer fit the
+            # screens) but let the print go ahead.
+            if not self.hidden:
+                self.drop_parent()
+                self.let_go()
             log("monitors changed while hidden; closing later if it comes back")
             self.monitors_stale = True
             return False
@@ -4290,11 +4296,14 @@ class Overlay:
                 show_own()
             return False
 
+        attempt = self.print_attempt = object()  # (a newer Print press replaces this one)
+
         def start(parent):
             """Like Lightshot, the print dialog sits on top of the screenshot. Without a
             way to tell the dialog which window it belongs to, it could open behind
             the full-screen screenshot, so then the screenshot steps aside instead."""
-            if self.closed or not self.dialog_open:
+            if self.closed or not self.dialog_open or self.print_attempt is not attempt:
+                self.drop_parent()
                 return
             self.dialog_on_top = bool(parent)
             if parent:
@@ -4324,7 +4333,7 @@ class Overlay:
         """Calls done(handle): a name for the screenshot window (the monitor with the
         selection) that another program's dialog can attach itself to, so it stays on
         top of it. "" if that isn't possible here."""
-        self.parent_handle = None
+        self.drop_parent()                        # (one left over from an earlier try)
         answered = []
 
         def reply(handle):
@@ -4346,8 +4355,8 @@ class Overlay:
                     def got(_top, handle, *_):
                         if handle:
                             self.parent_handle = (surf, handle)
-                            if answered:          # too late: already went on without it
-                                self.drop_parent()
+                            if answered or self.closed or not self.dialog_open:
+                                self.drop_parent()    # too late, or the print was cancelled
                         reply(f"wayland:{handle}" if handle else "")
                     # (called through the class: the window was made before GdkWayland
                     # was loaded, so the object itself doesn't know these methods)
@@ -4547,7 +4556,10 @@ def run_print_portal(parent=""):
         say("unavailable", msg=str(e))
         return
     if not res or res[0] != 0:
-        say("cancelled")
+        if res and res[0] == 1:
+            say("cancelled")
+        else:                                     # (2: the portal refused or broke)
+            say("failed", msg=f"the print dialog answered {res[0] if res else None}")
         return
     results = res[1]
     say("prepared", page=results.get("page-setup", {}))
@@ -4663,7 +4675,9 @@ class PortalPrint:
         self.on_end(result)
 
     def cancel(self):
-        if not self.ended:
+        if self.prepared:
+            return                                # Print was already clicked: the page is
+        if not self.ended:                        # on its way, so let the job finish
             try:
                 self.proc.stdin.close()           # the helper closes the dialog and exits
             except Exception:
@@ -5685,10 +5699,13 @@ def qt_to_accel(code):
 # belong to the screenshot (the print dialog) stay on top of it. Works on Plasma 5 and 6.
 KWIN_SCRIPT_NAME = "snypshot-keep-on-top"
 KWIN_SCRIPT = r"""
-function isShot(w) { return !!w && w.resourceClass == "snypshot" && w.caption == "snypshot"; }
-function ours(w) {          // snypshot's windows, or a dialog attached to one
+// (KWin may add " <2>" to a second window with the same title: one per monitor)
+function isShot(w) { return !!w && w.resourceClass == "snypshot" && /^snypshot( <\d+>)?\u200e?$/.test(String(w.caption)); }
+// The desktop's dialog windows (the print dialog): only there because an app asked
+function isPortal(w) { return !!w && /xdg-desktop-portal/.test(String(w.resourceClass)); }
+function ours(w) {          // snypshot's windows, a dialog attached to one, or a portal dialog
     for (var i = 0; w && i < 10; i++) {
-        if (w.resourceClass == "snypshot") return true;
+        if (w.resourceClass == "snypshot" || isPortal(w)) return true;
         w = w.transientFor;
     }
     return false;
@@ -5725,7 +5742,14 @@ function activated(w) {     // another app took focus while the screenshot is up
 }
 var l = all();
 for (var i = 0; i < l.length; i++) setUp(l[i]);
-function added(w) { setUp(w); keepUp(); }
+function added(w) {
+    setUp(w);
+    if (isPortal(w) && shots().length) {      // even if it isn't attached to the screenshot
+        w.keepAbove = true;
+        if (workspace.windowList) workspace.activeWindow = w; else workspace.activeClient = w;
+    }
+    keepUp();
+}
 if (workspace.windowAdded) workspace.windowAdded.connect(added); else workspace.clientAdded.connect(added);
 if (workspace.windowActivated) workspace.windowActivated.connect(activated);
 else if (workspace.clientActivated) workspace.clientActivated.connect(activated);
@@ -6325,7 +6349,11 @@ class Daemon:
                 self.kde_keys = KdeShortcut(self)
             except Exception as e:
                 log(f"KDE shortcut service not available: {e}")
-            kwin_keep_on_top()                    # the screenshot always stays on top
+            # The screenshot always stays on top: load the KWin script now, and again
+            # whenever KWin (re)starts (it forgets scripts when it restarts).
+            Gio.bus_watch_name(Gio.BusType.SESSION, "org.kde.KWin",
+                               Gio.BusNameWatcherFlags.NONE,
+                               lambda *_: kwin_keep_on_top(), None)
             if os.path.isfile(KDE_PY) and not kde_py_current():
                 log("Python was updated; snypshot's copy is out of date (using Spectacle)")
                 notify("Python was updated, so screenshots are slower for now. Run "

@@ -80,7 +80,7 @@ KDE Plasma doesn't need that: KWin hands screenshots to apps it's told to trust,
 
 ## Privacy and security
 
-- Screenshots never touch the disk unless you save them. Printing hands the page to your desktop's print dialog in memory (snypshot's own print window, used only where there's no such dialog, writes a temporary PDF in a private folder and deletes it right after). They go from GNOME Shell or KWin to snypshot over a private pipe.
+- Screenshots never touch the disk unless you save or print them. snypshot hands the page to your desktop's print dialog in memory, but the print system spools it to disk like any print job. snypshot's own fallback print window writes a temporary PDF in a private folder and deletes it right after. They go from GNOME Shell or KWin to snypshot over a private pipe.
 - On GNOME, the extension only hands screenshots to the copy of snypshot it started itself, and only if that copy is installed by root, so other programs can't swap themselves in. It refuses while snypshot is being debugged.
 - On KDE, KWin trusts snypshot's own copy of Python (installed by root) to take screenshots, for every user on this computer. Like Spectacle's permission, that means programs you run could use it to take a screenshot without asking, which KDE already allows through Spectacle anyway.
 - The overlay is a native Wayland window that other apps can't read.

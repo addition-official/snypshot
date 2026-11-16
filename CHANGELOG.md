@@ -4,14 +4,14 @@
 
 **Changed**
 - KDE: the screenshot now stays on top of everything on every monitor while it's open, like Lightshot. Windows that pop up meanwhile (for example Zoom when screen sharing ends) can't cover it or take focus from it, and it no longer shows up in the taskbar or Alt+Tab. Dialogs that belong to it, like the print dialog, still open on top of it.
-- Printing now uses your desktop's own print dialog (KDE's on Plasma, GTK's on GNOME), with all your printer's settings, instead of snypshot's own print window. snypshot's window is still there as a backup on desktops without one. Like Lightshot, the dialog opens on top of the screenshot instead of the screenshot disappearing first (on desktops that can't do that, the screenshot steps aside as before). Pressing Print Screen or Esc while the print dialog is open closes it and brings the screenshot back.
+- Printing now uses your desktop's own print dialog (KDE's on Plasma, GTK's on GNOME), with all your printer's settings, instead of snypshot's own print window. snypshot's window is still there as a backup on desktops without one. Like Lightshot, the dialog opens on top of the screenshot instead of the screenshot disappearing first (on desktops that can't do that, the screenshot steps aside as before). Pressing Print Screen or Esc while the print dialog is open closes it and brings the screenshot back (once you've clicked Print, the page is on its way and the screenshot closes when it's sent).
 - KDE: Alt+Tab and other desktop shortcuts don't switch away from a screenshot while it's open.
 - Right-click no longer throws the screenshot away (it was too easy to hit by accident). Esc still cancels.
 - Like Lightshot, dragging the box past the edge of the screen now eats the part that goes past it, and dragging back doesn't bring it back. Between two monitors it still moves across.
 - If the editor ever fails to open after a screenshot, you no longer lose the screenshot: the full screen is saved where Ctrl+S saves and copied to the clipboard, and a notification tells you where it went.
 
 **Fixed**
-- The screenshot no longer shows up in the taskbar with a generic Wayland icon; it uses snypshot's icon.
+- GNOME: the screenshot no longer shows up in the taskbar with a generic Wayland icon; it uses snypshot's icon.
 - The editor could fail to open after taking a screenshot ("returned NULL without setting an exception" in the log), so no screenshot could be taken. The color picker's hue bar is now drawn without the Pillow call that failed.
 - `snypshot --uninstall` now cleans up GNOME and KDE even when run over SSH, from a console or from your other desktop. Before, Print Screen could stop working on the desktop you weren't on, and the GNOME helper stayed installed.
 - `sudo snypshot` now tells you to run it as yourself. Before, `sudo snypshot --uninstall` removed nothing but said snypshot was gone.
