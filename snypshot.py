@@ -1417,6 +1417,7 @@ def grab_kwin():
                 # while we're non-dumpable. So allow that just for the moment of the call
                 # (core dumps stay off through the size limit).
                 no_dumps(False)
+                t0 = time.time()
                 try:
                     res, _ = bus.call_with_unix_fd_list_sync(
                         "org.kde.KWin", "/org/kde/KWin/ScreenShot2", "org.kde.KWin.ScreenShot2",
@@ -1441,6 +1442,8 @@ def grab_kwin():
                     data += chunk
             finally:
                 os.close(r)
+            if time.time() - t0 > 1:
+                log(f"KWin took {time.time() - t0:.1f}s for screen {name}")
             W, H, stride = int(meta["width"]), int(meta["height"]), int(meta["stride"])
             if not (0 < W <= 16384 and 0 < H <= 16384 and len(data) >= stride * H):
                 raise ValueError("odd screenshot from KWin")
@@ -6165,6 +6168,7 @@ class KdeShortcut:
     def _pressed(self, conn, sender, path, iface, signal, params):
         comp, action = params.unpack()[:2]
         if comp == KDE_ACTION[0] and action == KDE_ACTION[1]:
+            log("KDE: shortcut pressed")
             GLib.idle_add(lambda: self.daemon.capture() or False)
 
 
@@ -6481,6 +6485,7 @@ class Daemon:
         if self.shot is not None and self.shot.dialog_win is not None:
             dlg = self.shot.dialog_window()       # a save/print dialog is open: go back to it
             if dlg is not None:
+                log("capture: a save/print dialog is open; going back to it")
                 dlg.present()
                 return
             self.shot.close()                     # one that never showed up: start fresh
@@ -6488,9 +6493,11 @@ class Daemon:
         if self.shot is not None and getattr(self.shot, "hidden", False):
             self.shot.close()                     # a leftover hidden overlay: start fresh
         if self.shot is not None:                 # already open: just bring it forward
+            log("capture: a screenshot is already open; bringing it forward")
             self.shot.take_focus()
             return
         if self.busy:
+            log("capture: still busy with the previous one")
             return
         self.busy = True
         img = None
