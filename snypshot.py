@@ -5694,9 +5694,11 @@ def qt_to_accel(code):
 # that pops up meanwhile (Zoom after screen sharing ends, a chat, a notification
 # window) must not cover it on any monitor. Wayland apps can't ask for that themselves,
 # so on KDE snypshot loads this small KWin script. It marks the screenshot's windows
-# "keep above", keeps them out of the taskbar and Alt+Tab, raises them back over any
-# window that climbs above them, and takes focus back from other apps. Dialogs that
-# belong to the screenshot (the print dialog) stay on top of it. Works on Plasma 5 and 6.
+# "keep above", keeps them out of the taskbar and Alt+Tab, and raises them back over
+# any window that climbs above them. Dialogs that belong to the screenshot (the print
+# dialog) stay on top of it. It takes focus back from other apps only while the
+# screenshot is fully open: doing that while it closed could crash KWin and sent focus
+# to the wrong app afterwards. Works on Plasma 5 and 6.
 KWIN_SCRIPT_NAME = "snypshot-keep-on-top"
 KWIN_SCRIPT = r"""
 // (KWin may add " <2>" to a second window with the same title: one per monitor)
@@ -5734,23 +5736,31 @@ function keepUp() {         // Plasma 6: raise a screenshot window back over any
         }
     } finally { busy = false; }
 }
+var l = all();
+for (var i = 0; i < l.length; i++) setUp(l[i]);
+// Focus: only while the screenshot is fully open. Once one of its windows goes away
+// (it's closing, or stepping aside for the Save dialog), focus is left alone, so KWin
+// hands it back to the app you were using and never to a window that is closing.
+var closing = true;
+function added(w) {
+    if (isShot(w) && shots().length == 1) closing = false;   // a new screenshot
+    setUp(w);
+    if (isPortal(w) && shots().length)        // even if it isn't attached to the screenshot
+        w.keepAbove = true;
+    keepUp();
+}
+function removed(w) { if (isShot(w)) closing = true; }
 function activated(w) {     // another app took focus while the screenshot is up: take it back
-    if (!w || ours(w)) return;
+    if (closing || !w || ours(w)) return;
     var s = shots();
+    for (var i = 0; i < s.length; i++) {
+        if (s[i].deleted || s[i].minimized) return;
+    }
     if (!s.length) return;
     if (workspace.windowList) workspace.activeWindow = s[0]; else workspace.activeClient = s[0];
 }
-var l = all();
-for (var i = 0; i < l.length; i++) setUp(l[i]);
-function added(w) {
-    setUp(w);
-    if (isPortal(w) && shots().length) {      // even if it isn't attached to the screenshot
-        w.keepAbove = true;
-        if (workspace.windowList) workspace.activeWindow = w; else workspace.activeClient = w;
-    }
-    keepUp();
-}
 if (workspace.windowAdded) workspace.windowAdded.connect(added); else workspace.clientAdded.connect(added);
+if (workspace.windowRemoved) workspace.windowRemoved.connect(removed); else workspace.clientRemoved.connect(removed);
 if (workspace.windowActivated) workspace.windowActivated.connect(activated);
 else if (workspace.clientActivated) workspace.clientActivated.connect(activated);
 if (workspace.stackingOrderChanged) workspace.stackingOrderChanged.connect(keepUp);
