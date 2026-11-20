@@ -5779,8 +5779,9 @@ KWIN_SCRIPT_NAME = "snypshot-keep-on-top"
 KWIN_SCRIPT = r"""
 // (KWin may add " <2>" to a second window with the same title: one per monitor)
 function isShot(w) { return !!w && w.resourceClass == "snypshot" && /^snypshot( <\d+>)?\u200e?$/.test(String(w.caption)); }
-// The desktop's dialog windows (the print dialog): only there because an app asked
-function isPortal(w) { return !!w && /xdg-desktop-portal/.test(String(w.resourceClass)); }
+// The desktop's dialog windows (the print dialog): only there because an app asked.
+// (KDE's calls itself "org.freedesktop.impl.portal.desktop.kde", others "xdg-desktop-portal-...")
+function isPortal(w) { return !!w && /xdg-desktop-portal|^org\.freedesktop\.impl\.portal\./.test(String(w.resourceClass)); }
 function ours(w) {          // snypshot's windows, a dialog attached to one, or a portal dialog
     for (var i = 0; w && i < 10; i++) {
         if (w.resourceClass == "snypshot" || isPortal(w)) return true;
