@@ -7340,6 +7340,11 @@ def main():
         elif running:
             running = running.split()[0]
         print(f"background:     {('running ' + running) if running else 'not running (start: snypshot --daemon)'}")
+        if not running and use_service() and systemctl("is-failed", "--quiet", SERVICE):
+            # (systemd stops restarting it after many failures in a row; until it's
+            # started again, Print Screen does nothing at all)
+            print("service:        stopped after failing repeatedly; snypshot --daemon starts "
+                  "it again (why it failed: ~/.cache/snypshot/snypshot.log)")
         if "gnome" in os.environ.get("XDG_CURRENT_DESKTOP", "").lower():
             print(f"GNOME helper:   {helper_status()}")
             print(f"portal opt-in:  {'yes (less private)' if load_config().get('allow_portal') else 'no'}")
