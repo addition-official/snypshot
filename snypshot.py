@@ -7308,6 +7308,13 @@ def main():
             log("service: the session hasn't told systemd about the screen yet; retrying")
             sys.exit(1)                           # (never fall back to X11 by accident)
         rotate_log()                              # (the service path skips the one below)
+        # The log gets everything the background copy prints, like the other ways it
+        # starts: what GTK says right before it exits (a Wayland "Error 71") would
+        # otherwise only reach the journal, not the log everyone is pointed at.
+        fd = log_fd()
+        os.dup2(fd, 1)
+        os.dup2(fd, 2)
+        os.close(fd)
         py = daemon_python()
         os.execve(py, [py, "-I", SCRIPT, "--daemon", "--foreground"], clean_env())
     if "--bind-key" in args:
