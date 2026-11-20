@@ -42,6 +42,7 @@
 - GNOME: moving snypshot off Shift+Print or Alt+Print now gives that key back to GNOME's screenshot tool. Before, only Print Screen came back. snypshot remembers which of GNOME's screenshot keys it took, so one you switched off yourself in Settings stays off.
 - The log file (`~/.cache/snypshot/snypshot.log`) no longer grows forever: once it passes 1 MB it is moved to `snypshot.log.old` the next time snypshot starts in the background.
 - Unplugging a monitor after taking screenshots (docking or undocking, a KVM switch, or a monitor that drops off when it's turned off) could crash snypshot, so Print Screen did nothing for a few seconds until it restarted.
+- If the desktop closed one of the screenshot's windows (Alt+F4 outside KDE, a window menu, the close button in the window overview), the rest of the screenshot stayed half open, and the next Print Screen brought back the old screenshot instead of taking a new one. Now the whole screenshot closes, like Esc.
 
 **Security**
 - Saving over an existing file from the Save dialog keeps it as private as it was: a file only you could read no longer becomes readable by everyone.

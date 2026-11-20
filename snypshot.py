@@ -2129,6 +2129,7 @@ class Overlay:
 
             win.fullscreen_on_monitor(gm)
             win.connect("map", self._block_shortcuts)
+            win.connect("close-request", self._close_requested)
             self.wins.append(win)
             self.areas.append(area)
         self.root = self.wins[0]
@@ -2218,6 +2219,15 @@ class Overlay:
                 surface.restore_system_shortcuts()
             except Exception as e:
                 log(f"couldn't hand back desktop shortcuts: {e}")
+
+    def _close_requested(self, win):
+        """The desktop asked to close one window (Alt+F4 outside KDE, a window menu, the
+        overview's close button, logging out). Close the whole screenshot properly
+        instead: left to itself, GTK destroys just that window, and the rest stays half
+        open with the shortcut block never handed back. (From idle, so the window isn't
+        destroyed from inside its own signal; returning True keeps it until then.)"""
+        GLib.idle_add(lambda: self.close() or False)
+        return True
 
     @staticmethod
     def _destroy_window(win):
