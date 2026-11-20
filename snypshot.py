@@ -2142,10 +2142,20 @@ class Overlay:
         # select the wrong part), so close it. (Connected last, so a failure above can't
         # leave it behind; let go of in _teardown.)
         self._mons = mons
-        self._mon_hid = mons.connect("items-changed", lambda *a: GLib.idle_add(
-            self._monitors_changed))
+        self._mon_job = None
+
+        def changed(*_):                          # (several can come at once: check once)
+            if not self._mon_job:
+                self._mon_job = GLib.idle_add(self._monitors_changed)
+        self._mon_hid = mons.connect("items-changed", changed)
+        # The same when a monitor stays but changes its size, scale or position (display
+        # settings, rotation): GTK keeps the same monitor then, so the list doesn't change.
+        # ("scale" is the fractional one, GTK 4.14 and later.)
+        self._gmon_hids = [(gm, gm.connect(f"notify::{prop}", changed))
+                           for gm in self.gmons for prop in ("geometry", "scale-factor", "scale")]
 
     def _monitors_changed(self):
+        self._mon_job = None
         if self.closed:
             return False
         if self.hidden or self.dialog_open:
@@ -2447,6 +2457,12 @@ class Overlay:
             except Exception:
                 pass
             self._mon_hid = None
+        for gm, hid in getattr(self, "_gmon_hids", ()):
+            try:
+                gm.disconnect(hid)
+            except Exception:
+                pass
+        self._gmon_hids = []
         self.cancel_dialog()
         if self.picker and self.picker.get("modern"):
             self.save_mine()                      # keep edits to your colors
