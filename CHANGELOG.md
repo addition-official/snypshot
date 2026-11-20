@@ -45,6 +45,7 @@
 - If the desktop closed one of the screenshot's windows (Alt+F4 outside KDE, a window menu, the close button in the window overview), the rest of the screenshot stayed half open, and the next Print Screen brought back the old screenshot instead of taking a new one. Now the whole screenshot closes, like Esc.
 - If the desktop's print service never confirmed a print after you clicked Print (for example because it crashed or the printing stalled), the screenshot stayed on top of everything with Esc, clicks and Print Screen doing nothing until snypshot was killed. Now Esc or Print Screen closes it, and if the print service crashed, snypshot says printing didn't work and brings the screenshot back.
 - Pressing Print Screen right after clicking Save or Print, before its window showed up, threw the screenshot and your drawings away and started a new one. Now the Save or Print window opens as usual.
+- KDE: when another app grabbed focus while a screenshot was open (for example Zoom or a chat pop-up), it got focus once the screenshot closed, instead of the app you were using.
 - KDE: if the desktop's print dialog didn't attach itself to the screenshot, it opened behind the screenshot and every click on it was taken back, so you couldn't print. The keep-on-top script now recognizes KDE's real print dialog.
 
 **Security**

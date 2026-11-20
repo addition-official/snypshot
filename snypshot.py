@@ -5820,22 +5820,48 @@ for (var i = 0; i < l.length; i++) setUp(l[i]);
 // hands it back to the app you were using and never to a window that is closing.
 // (Loaded again while a screenshot is up: keep guarding that one.)
 var closing = !shots().length;
+// The app you were using. KWin alone would hand focus to the last app that grabbed it
+// while the screenshot was up (and had it taken back), so remember the right one.
+function activeNow() { return workspace.activeWindow !== undefined ? workspace.activeWindow : workspace.activeClient; }
+function activate(w) { if (workspace.windowList) workspace.activeWindow = w; else workspace.activeClient = w; }
+function alive(w) { var l = all(); for (var i = 0; i < l.length; i++) if (l[i] === w) return !w.deleted && !w.minimized; return false; }
+var prev = activeNow();
+if (prev && ours(prev)) prev = null;
+var stole = false, giveBack = false;
 function added(w) {
-    if (isShot(w) && shots().length == 1) closing = false;   // a new screenshot
+    if (isShot(w) && shots().length == 1) { closing = false; stole = giveBack = false; }   // a new screenshot
     setUp(w);
     if (isPortal(w) && shots().length)        // even if it isn't attached to the screenshot
         w.keepAbove = true;
     keepUp();
 }
-function removed(w) { if (isShot(w)) closing = true; }
-function activated(w) {     // another app took focus while the screenshot is up: take it back
-    if (closing || !w || ours(w)) return;
+function removed(w) {
+    if (w === prev) prev = null;
+    if (!isShot(w)) return;
+    // (Armed on the first one: KWin picks the next app before the last one is gone.)
+    if (!closing && stole) giveBack = true;
+    closing = true;
+}
+function activated(w) {
+    if (!w) return;
+    if (giveBack) {         // the screenshot just went away after taking focus back
+        if (!ours(w)) {     // KWin picked an app: the one you were using, not the one
+            giveBack = stole = false;              // that grabbed focus meanwhile
+            if (w !== prev && prev && !ours(prev) && alive(prev)) activate(prev);
+            return;
+        }
+        if (!isShot(w)) giveBack = false;          // its Save dialog has focus: leave it
+    }
+    if (ours(w)) return;
+    if (!shots().length) { prev = w; return; }    // no screenshot up: what you're using
+    if (closing) return;
+    // Another app took focus while the screenshot is up: take it back.
     var s = shots();
     for (var i = 0; i < s.length; i++) {
         if (s[i].deleted || s[i].minimized) return;
     }
-    if (!s.length) return;
-    if (workspace.windowList) workspace.activeWindow = s[0]; else workspace.activeClient = s[0];
+    stole = true;
+    activate(s[0]);
 }
 if (workspace.windowAdded) workspace.windowAdded.connect(added); else workspace.clientAdded.connect(added);
 if (workspace.windowRemoved) workspace.windowRemoved.connect(removed); else workspace.clientRemoved.connect(removed);
