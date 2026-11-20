@@ -7311,10 +7311,13 @@ def main():
         # The log gets everything the background copy prints, like the other ways it
         # starts: what GTK says right before it exits (a Wayland "Error 71") would
         # otherwise only reach the journal, not the log everyone is pointed at.
-        fd = log_fd()
-        os.dup2(fd, 1)
-        os.dup2(fd, 2)
-        os.close(fd)
+        try:
+            fd = log_fd()
+            os.dup2(fd, 1)
+            os.dup2(fd, 2)
+            os.close(fd)
+        except OSError:
+            pass                                  # (no log then, but still start)
         py = daemon_python()
         os.execve(py, [py, "-I", SCRIPT, "--daemon", "--foreground"], clean_env())
     if "--bind-key" in args:

@@ -11,6 +11,7 @@
 - If the editor ever fails to open after a screenshot, you no longer lose the screenshot: the full screen is saved where Ctrl+S saves and copied to the clipboard, and a notification tells you where it went.
 
 **Fixed**
+- KDE: snypshot could crash in the background after a while, so Print Screen did nothing for a few seconds (and the taskbar icon flickered). The log showed "Error 71 (Protocol error)". It no longer leaves KWin's shortcut block behind when a screenshot closes.
 - GNOME: the screenshot no longer shows up in the taskbar with a generic Wayland icon; it uses snypshot's icon.
 - The editor could fail to open after taking a screenshot ("returned NULL without setting an exception" in the log), so no screenshot could be taken. The color picker's hue bar is now drawn without the Pillow call that failed.
 - `snypshot --uninstall` now cleans up GNOME and KDE even when run over SSH, from a console or from your other desktop. Before, Print Screen could stop working on the desktop you weren't on, and the GNOME helper stayed installed.
