@@ -44,6 +44,7 @@
 - Unplugging a monitor after taking screenshots (docking or undocking, a KVM switch, or a monitor that drops off when it's turned off) could crash snypshot, so Print Screen did nothing for a few seconds until it restarted.
 - If the desktop closed one of the screenshot's windows (Alt+F4 outside KDE, a window menu, the close button in the window overview), the rest of the screenshot stayed half open, and the next Print Screen brought back the old screenshot instead of taking a new one. Now the whole screenshot closes, like Esc.
 - If the desktop's print service never confirmed a print after you clicked Print (for example because it crashed or the printing stalled), the screenshot stayed on top of everything with Esc, clicks and Print Screen doing nothing until snypshot was killed. Now Esc or Print Screen closes it, and if the print service crashed, snypshot says printing didn't work and brings the screenshot back.
+- Pressing Print Screen right after clicking Save or Print, before its window showed up, threw the screenshot and your drawings away and started a new one. Now the Save or Print window opens as usual.
 
 **Security**
 - Saving over an existing file from the Save dialog keeps it as private as it was: a file only you could read no longer becomes readable by everyone.

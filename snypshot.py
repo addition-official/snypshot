@@ -2416,6 +2416,7 @@ class Overlay:
 
     def let_go(self):
         self.hidden = True
+        self.hidden_at = time.monotonic()
         for win in self.wins:
             self._unblock_shortcuts(win)          # (before hiding: see _block_shortcuts)
             win.set_visible(False)
@@ -6563,6 +6564,12 @@ class Daemon:
             self.shot.close()                     # one that never showed up: start fresh
             self.shot = None
         if self.shot is not None and getattr(self.shot, "hidden", False):
+            if (self.shot.dialog_open
+                    and time.monotonic() - getattr(self.shot, "hidden_at", 0) < 3):
+                # Save or Print was just clicked and its dialog shows up in a moment:
+                # starting fresh now would throw the screenshot and its drawings away.
+                log("capture: a save/print dialog is about to open; leaving it be")
+                return
             self.shot.close()                     # a leftover hidden overlay: start fresh
         if self.shot is not None:                 # already open: just bring it forward
             log("capture: a screenshot is already open; bringing it forward")
