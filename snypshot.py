@@ -4412,9 +4412,12 @@ class Overlay:
                 if isinstance(surf, GdkWayland.WaylandToplevel):
                     def got(_top, handle, *_):
                         if handle:
-                            self.parent_handle = (surf, handle)
                             if answered or self.closed or not self.dialog_open:
-                                self.drop_parent()    # too late, or the print was cancelled
+                                # Too late, or the print was cancelled: drop just this
+                                # one, a newer Print press may have its own by now.
+                                self._drop_handle(surf, handle)
+                            else:
+                                self.parent_handle = (surf, handle)
                         reply(f"wayland:{handle}" if handle else "")
                     # (called through the class: the window was made before GdkWayland
                     # was loaded, so the object itself doesn't know these methods)
@@ -4435,16 +4438,18 @@ class Overlay:
     def drop_parent(self):
         ph, self.parent_handle = getattr(self, "parent_handle", None), None
         if ph:
-            surf, handle = ph
-            try:
-                from gi.repository import GdkWayland
-                T = GdkWayland.WaylandToplevel
-                if hasattr(T, "drop_exported_handle"):
-                    T.drop_exported_handle(surf, handle)
-                else:
-                    T.unexport_handle(surf)
-            except Exception:
-                pass
+            self._drop_handle(*ph)
+
+    def _drop_handle(self, surf, handle):
+        try:
+            from gi.repository import GdkWayland
+            T = GdkWayland.WaylandToplevel
+            if hasattr(T, "drop_exported_handle"):
+                T.drop_exported_handle(surf, handle)
+            elif not (self.parent_handle and self.parent_handle[0] is surf):
+                T.unexport_handle(surf)       # (older GTK: this drops all of the window's)
+        except Exception:
+            pass
 
     def back_from_dialog(self):
         if self.monitors_stale:                   # the monitors changed meanwhile: the
