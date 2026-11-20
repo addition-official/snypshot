@@ -2194,9 +2194,13 @@ class Overlay:
     def _block_shortcuts(win):
         """Like Lightshot: while the screenshot is up, Alt+Tab and other desktop
         shortcuts don't take you away from it. KDE allows this right away; GNOME would
-        pop up a permission question every time, so it's KDE only. (Again on every
-        show, since hiding for a save dialog drops it.)"""
-        if not is_kde():
+        pop up a permission question every time, so it's KDE only. Asked again on every
+        show and always handed back BEFORE the window hides or closes (let_go, close):
+        once it's hidden, GTK forgets the request without telling KWin, and KWin later
+        mistakes that leftover for a second request from a new window that got the
+        same id, and disconnects snypshot ("Error 71", Print Screen dead until the
+        service restarts it)."""
+        if not is_kde() or getattr(win, "snyp_blocked", None) is not None:
             return
         try:
             # (With no seat, e.g. a headless session, GTK can't do this and logs a
@@ -2205,8 +2209,18 @@ class Overlay:
             if surface is None or win.get_display().get_default_seat() is None:
                 return
             surface.inhibit_system_shortcuts(None)
+            win.snyp_blocked = surface
         except Exception as e:
             log(f"couldn't block desktop shortcuts: {e}")
+
+    @staticmethod
+    def _unblock_shortcuts(win):
+        surface, win.snyp_blocked = getattr(win, "snyp_blocked", None), None
+        if surface is not None:
+            try:
+                surface.restore_system_shortcuts()
+            except Exception as e:
+                log(f"couldn't hand back desktop shortcuts: {e}")
 
     # --- GLib timer helpers (stand-ins for Tk's after / after_cancel)
 
@@ -2379,12 +2393,15 @@ class Overlay:
     def let_go(self):
         self.hidden = True
         for win in self.wins:
+            self._unblock_shortcuts(win)          # (before hiding: see _block_shortcuts)
             win.set_visible(False)
 
     def close(self):
         if self.closed:
             return
         self.closed = True
+        for win in self.wins:                     # hand Alt+Tab back while the windows
+            self._unblock_shortcuts(win)          # are still up (see _block_shortcuts)
         try:
             self._teardown()
         finally:                        # whatever happens above, the windows must go
