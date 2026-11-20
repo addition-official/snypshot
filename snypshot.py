@@ -2008,10 +2008,7 @@ class Overlay:
         except BaseException:                     # never leave half-made windows behind
             self.closed = True
             for win in self.wins:
-                try:
-                    win.destroy()
-                except Exception:
-                    pass
+                self._destroy_window(win)
             self.wins = []
             raise
 
@@ -2222,6 +2219,23 @@ class Overlay:
             except Exception as e:
                 log(f"couldn't hand back desktop shortcuts: {e}")
 
+    @staticmethod
+    def _destroy_window(win):
+        """Destroy one overlay window, leaving its monitor first. GTK 4.14 ties every
+        window made with fullscreen_on_monitor to that monitor and doesn't untie it when
+        the window is destroyed, so unplugging the monitor later (docking, a KVM switch,
+        a monitor that drops off when powered down) calls into the freed window and
+        crashes snypshot. Plain fullscreen() unties it; the window is gone right after,
+        so nothing visible happens. (Not redundant: don't remove.)"""
+        try:
+            win.fullscreen()
+        except Exception:
+            pass
+        try:
+            win.destroy()
+        except Exception:
+            pass
+
     # --- GLib timer helpers (stand-ins for Tk's after / after_cancel)
 
     def after(self, ms, fn):
@@ -2406,10 +2420,7 @@ class Overlay:
             self._teardown()
         finally:                        # whatever happens above, the windows must go
             for win in self.wins:
-                try:
-                    win.destroy()
-                except Exception:
-                    pass
+                self._destroy_window(win)
             self.wins, self.areas, self.gmons = [], [], []
             self.parts = None
             self.annots, self.undone, self.cur = [], [], None
