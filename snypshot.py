@@ -4555,7 +4555,18 @@ def run_print_portal(parent=""):
                               "/org/freedesktop/portal/desktop",
                               "org.freedesktop.portal.Print", method, args,
                               GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, 30000, None)
-            loop.run()                            # until the answer (or snypshot gives up)
+
+            def portal_gone(*_):                  # it crashed or restarted: no answer
+                if state["result"] is None:       # will ever come, so don't wait forever
+                    state["result"] = (2, {})
+                    loop.quit()
+            watch = Gio.bus_watch_name_on_connection(
+                bus, "org.freedesktop.portal.Desktop", Gio.BusNameWatcherFlags.NONE,
+                None, portal_gone)
+            try:
+                loop.run()                        # until the answer (or snypshot gives up)
+            finally:
+                Gio.bus_unwatch_name(watch)
         finally:
             bus.signal_unsubscribe(sub)
         return state["result"]
@@ -4665,7 +4676,8 @@ class PortalPrint:
         import threading
         self.img, self.unit, self.on_end = img, unit, on_end
         extra = [parent] if PARENT_HANDLE.fullmatch(parent or "") else []
-        self.ended = self.prepared = False
+        self.ended = self.prepared = self.sent = False
+        self.reap_job = None
         with os.fdopen(log_fd(), "a") as err:
             self.proc = subprocess.Popen(
                 [sys.executable, "-I", SCRIPT, "--print-portal", *extra], stdin=subprocess.PIPE,
@@ -4684,15 +4696,21 @@ class PortalPrint:
         GLib.idle_add(self._got, {"event": "gone"})
 
     def _got(self, msg):
+        ev = msg.get("event")
+        if ev == "gone" and self.reap_job:        # (the helper is gone: nothing to reap)
+            GLib.source_remove(self.reap_job)
+            self.reap_job = None
         if self.ended:
             return False
-        ev = msg.get("event")
         if ev == "prepared":
             self.prepared = True
             try:
                 pdf = page_pdf(self.img, msg.get("page") or {}, self.unit)
                 self.proc.stdin.write(f"{len(pdf)}\n".encode() + pdf)
                 self.proc.stdin.flush()
+                self.sent = True
+                # (a portal that never answers must not keep the helper around forever)
+                self.reap_job = GLib.timeout_add_seconds(600, self._reap)
             except Exception:
                 log("print: couldn't hand over the page:\n" + traceback.format_exc())
                 self._end("failed")
@@ -4702,6 +4720,15 @@ class PortalPrint:
             self._end(ev)
         elif ev == "gone":                        # the helper died: before the dialog
             self._end("failed" if self.prepared else "unavailable")   # means no portal
+        return False
+
+    def _reap(self):
+        self.reap_job = None
+        if self.proc.poll() is None:
+            log("print portal: still no answer 10 minutes after Print; stopping the helper")
+            self.proc.kill()
+        if not self.ended:
+            self._end("failed")
         return False
 
     def _end(self, result):
@@ -4716,9 +4743,16 @@ class PortalPrint:
         self.on_end(result)
 
     def cancel(self):
-        if self.prepared:
-            return                                # Print was already clicked: the page is
-        if not self.ended:                        # on its way, so let the job finish
+        if self.prepared:                         # Print was already clicked: the page is
+            if self.sent and not self.ended:      # on its way, so let the job finish. But
+                # once the page is with the portal, nothing on screen waits for you any
+                # more: if the portal never answers (it crashed, or the printing stalls),
+                # Esc or Print Screen must still close the screenshot, which otherwise
+                # stays on top of everything with the keyboard blocked.
+                log("print: not waiting for the print portal any longer")
+                self._end("done")
+            return
+        if not self.ended:
             try:
                 self.proc.stdin.close()           # the helper closes the dialog and exits
             except Exception:
