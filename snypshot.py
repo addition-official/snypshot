@@ -5818,7 +5818,8 @@ for (var i = 0; i < l.length; i++) setUp(l[i]);
 // Focus: only while the screenshot is fully open. Once one of its windows goes away
 // (it's closing, or stepping aside for the Save dialog), focus is left alone, so KWin
 // hands it back to the app you were using and never to a window that is closing.
-var closing = true;
+// (Loaded again while a screenshot is up: keep guarding that one.)
+var closing = !shots().length;
 function added(w) {
     if (isShot(w) && shots().length == 1) closing = false;   // a new screenshot
     setUp(w);
