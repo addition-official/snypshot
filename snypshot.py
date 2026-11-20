@@ -6717,13 +6717,13 @@ Description=snypshot, Lightshot-style screenshots (the background part)
 PartOf=graphical-session.target
 After=graphical-session.target
 StartLimitIntervalSec=120
-StartLimitBurst=10
+StartLimitBurst=30
 ConditionEnvironment=XDG_CURRENT_DESKTOP=KDE
 
 [Service]
 ExecStart=/usr/bin/python3 -I "{script}" --service
 Restart=on-failure
-RestartSec=3
+RestartSec=1
 
 [Install]
 WantedBy=graphical-session.target
